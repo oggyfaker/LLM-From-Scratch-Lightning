@@ -37,21 +37,36 @@ Translate the from-scratch model implementation into production serving backends
 
 ```
 LLM_From_Scratch_Lightning/
-├── 0_Qwen3_SFT_LoRA_4bit.py              # Training script (Lightning)
 ├── 1_Qwen3_SFT_LoRA_4bit_Inference.ipynb  # Inference notebook (vLLM)
+├── collections/
+│   ├── qwen3/
+│   │   ├── 0_Qwen3_Jigsaw_Classify_Finetune.py     # Dense, Jigsaw rule classification
+│   │   ├── 1_Qwen3_MoE_Nemotron_Reasoning_FineTune.py  # MoE, Nemotron reasoning (Unsloth)
+│   │   ├── 2_Qwen3_Gsm8k_FineTune.py      # Dense 14B, GSM8K direct answer
+│   │   └── models/
+│   │       ├── qwen3_dense.py             # From-scratch Qwen3 dense model
+│   │       ├── qwen3_vllm.py              # vLLM-compatible dense wrapper
+│   │       ├── qwen_tokenizer.py          # Qwen3 tokenizer
+│   │       └── tokenizer.json             # Shared tokenizer (all Qwen3 sizes)
+│   └── utils/                             # Shared across model collections
+│       ├── checkpoint_utils.py            # LoRA merge, safetensor export, plotting
+│       ├── checkpoint_moe_utils.py        # MoE LoRA merge (3D experts → HF format)
+│       └── verify_checkpoint.py           # Merged-checkpoint diagnostic
 ├── data/
-│   └── Jigsaw2026/
-│       ├── data_utils.py                  # Dataset, collate, prompt formatting
-│       ├── train.csv
-│       └── test.csv
-├── models/
-│   └── Qwen3/
-│       ├── qwen3.py                       # From-scratch Qwen3 model & tokenizer
-│       ├── qwen3_vllm.py                  # vLLM-compatible model wrapper
-│       ├── qwen3-moe.py                   # MoE variant (Qwen3-30B-A3B)
-│       └── tokenizer.json                 # Shared tokenizer (all Qwen3 sizes)
-├── utils/
-│   └── checkpoint_utils.py                # LoRA merge, safetensor export, plotting
+│   ├── Jigsaw2026/
+│   │   ├── data_utils.py                  # Dataset, collate, prompt formatting
+│   │   ├── train.csv
+│   │   └── test.csv
+│   ├── NemotronReasoning2026/
+│   │   ├── data_utils.py                  # Reasoning dataset, chat formatting
+│   │   ├── clean_csv.py                   # CSV cleaning
+│   │   ├── merge_clean_datasets.py        # Dataset merge
+│   │   └── nemotron_decoded_clean.csv
+│   └── Gsm8k/
+│       ├── data_utils.py                  # GSM8K dataset, \boxed{} chat formatting
+│       ├── download_gsm8k.py              # Fetch from HF → train.json / test.json
+│       ├── train.json                     # 7473 records
+│       └── test.json                      # 1319 records
 ├── docs/
 │   ├── MODEL.md                           # Qwen3 architecture deep-dive
 │   ├── TRAINING.md                        # LoRA, quantization & training pipeline
@@ -112,6 +127,7 @@ pip install bitsandbytes==0.49.2
 
 ```bash
 pip install pandas==3.0.2 \
+            pyarrow==21.0.0 \
             safetensors==0.7.0 \
             tokenizers==0.22.2 \
             matplotlib==3.10.8 \
@@ -145,12 +161,21 @@ print('vLLM: OK')
 
 ### Training
 
-The training script downloads Qwen3-14B pretrained weights automatically on first run:
+The training script downloads Qwen3 pretrained weights automatically on first run:
 
 ```bash
 conda activate LLM
 cd LLM_From_Scratch_Lightning
-python 0_Qwen3_SFT_LoRA_4bit.py
+
+# Dense (from-scratch Qwen3, LoRA / QLoRA)
+python collections/qwen3/0_Qwen3_Jigsaw_Classify_Finetune.py
+
+# MoE 30B-A3B (Unsloth backbone, LoRA / QLoRA)
+python collections/qwen3/1_Qwen3_MoE_Nemotron_Reasoning_FineTune.py
+
+# GSM8K math, direct answer (Qwen3-14B)
+python data/Gsm8k/download_gsm8k.py     # once, builds train.json / test.json
+python collections/qwen3/2_Qwen3_Gsm8k_FineTune.py
 ```
 
 ### Inference

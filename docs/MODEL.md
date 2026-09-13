@@ -1,6 +1,6 @@
 # Qwen3 Model Architecture — From Scratch
 
-This document explains the full Qwen3 dense transformer architecture implemented in [`models/Qwen3/qwen3.py`](../models/Qwen3/qwen3.py), built entirely from PyTorch primitives — no HuggingFace Transformers dependency.
+This document explains the full Qwen3 dense transformer architecture implemented in [`collections/qwen3/models/qwen3_dense.py`](../collections/qwen3/models/qwen3_dense.py), built entirely from PyTorch primitives — no HuggingFace Transformers dependency.
 
 ---
 
@@ -16,7 +16,6 @@ This document explains the full Qwen3 dense transformer architecture implemented
 - [Full Model](#full-model)
 - [Model Configurations](#model-configurations)
 - [Weight Loading](#weight-loading)
-- [MoE Variant](#moe-variant)
 
 ---
 
@@ -37,12 +36,12 @@ Qwen3 is a decoder-only transformer with the following design choices:
 
 ## Tokenizer
 
-**File:** `models/Qwen3/qwen3.py` — `Qwen3Tokenizer`
+**File:** `collections/qwen3/models/qwen3_dense.py` — `Qwen3Tokenizer`
 
 Wraps the HuggingFace `tokenizers` library (Rust-backed BPE) with custom special token handling.
 
 ```python
-tokenizer = Qwen3Tokenizer("models/Qwen3/tokenizer.json")
+tokenizer = Qwen3Tokenizer("collections/qwen3/models/tokenizer.json")
 ```
 
 **Key features:**
@@ -56,7 +55,7 @@ tokenizer = Qwen3Tokenizer("models/Qwen3/tokenizer.json")
 
 Custom parameter names differ from HuggingFace convention:
 
-| Custom (qwen3.py) | vLLM |
+| Custom (qwen3_dense.py) | vLLM |
 |---|---|
 | `tok_emb.weight` | `model.embed_tokens.weight` |
 | `transformer_blocks.{id}.att.W_query.weight` | `model.layers.{id}.self_attn.q_proj.weight` |
@@ -193,30 +192,6 @@ Downloads safetensors from HuggingFace (supports sharded models), translates HF 
 
 Loads a merged `.pth` state_dict (post-LoRA merge) directly — keys already use custom naming convention.
 
----
-
-## MoE Variant
-
-**File:** [`models/Qwen3/qwen3-moe.py`](../models/Qwen3/qwen3-moe.py)
-
-Implements **Mixture of Experts** for Qwen3-30B-A3B:
-
-| Parameter | Value |
-|-----------|-------|
-| Total experts | 128 |
-| Active experts per token | 8 |
-| Expert hidden dim | 768 |
-| Effective hidden dim | 8 × 768 = 6144 |
-
-Each `MoEFeedForward` layer:
-1. **Router** (`gate`): linear projection → top-k expert selection
-2. **Softmax** over selected expert scores
-3. **Parallel expert computation**: each expert is a full SwiGLU FFN
-4. **Weighted aggregation**: outputs scaled by router probabilities
-
-The attention mechanism is identical to the dense model, using FlashAttention via PyTorch 2.x `scaled_dot_product_attention`.
-
----
 
 ## Text Generation
 

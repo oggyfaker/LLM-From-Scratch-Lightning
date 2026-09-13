@@ -1,6 +1,6 @@
 # Training Pipeline — LoRA + 4-bit Quantization
 
-This document explains the full training pipeline in [`0_Qwen3_SFT_LoRA_4bit.py`](../0_Qwen3_SFT_LoRA_4bit.py), covering LoRA injection, 4-bit quantization, gradient accumulation, and checkpoint management.
+This document explains the full training pipeline in [`collections/qwen3/0_Qwen3_SFT_LoRA_QLoRA.py`](../collections/qwen3/0_Qwen3_SFT_LoRA_QLoRA.py), covering LoRA injection, 4-bit quantization, gradient accumulation, and checkpoint management.
 
 ---
 
@@ -247,7 +247,7 @@ conda activate LLM
 cd LLM_From_Scratch_Lightning
 
 # First run: auto-downloads Qwen3-14B pretrained weights (~28GB)
-python 0_Qwen3_SFT_LoRA_4bit.py
+python collections/qwen3/0_Qwen3_SFT_LoRA_QLoRA.py
 ```
 
 ### Output directory structure

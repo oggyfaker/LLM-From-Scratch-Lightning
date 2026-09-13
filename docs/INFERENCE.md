@@ -1,6 +1,6 @@
 # Inference Pipeline — vLLM Integration
 
-This document explains how the custom Qwen3 model integrates with vLLM for high-throughput inference, implemented in [`models/Qwen3/qwen3_vllm.py`](../models/Qwen3/qwen3_vllm.py) and the inference notebook [`1_Qwen3_SFT_LoRA_4bit_Inference.ipynb`](../1_Qwen3_SFT_LoRA_4bit_Inference.ipynb).
+This document explains how the custom Qwen3 model integrates with vLLM for high-throughput inference, implemented in [`collections/qwen3/models/qwen3_vllm.py`](../collections/qwen3/models/qwen3_vllm.py) and the inference notebook [`1_Qwen3_SFT_LoRA_4bit_Inference.ipynb`](../1_Qwen3_SFT_LoRA_4bit_Inference.ipynb).
 
 ---
 
@@ -19,10 +19,10 @@ This document explains how the custom Qwen3 model integrates with vLLM for high-
 
 ## Overview
 
-The from-scratch Qwen3 model (`qwen3.py`) is designed for **training**. For **inference**, we wrap it in a vLLM-compatible class (`qwen3_vllm.py`) that replaces vanilla attention with PagedAttention and uses vLLM's optimized kernels.
+The from-scratch Qwen3 model (`qwen3_dense.py`) is designed for **training**. For **inference**, we wrap it in a vLLM-compatible class (`qwen3_vllm.py`) that replaces vanilla attention with PagedAttention and uses vLLM's optimized kernels.
 
 ```
-Training model (qwen3.py)          →  Inference model (qwen3_vllm.py)
+Training model (qwen3_dense.py)          →  Inference model (qwen3_vllm.py)
 ─────────────────────────          ─────────────────────────────────
 nn.Linear                         →  QKVParallelLinear / RowParallelLinear
 Manual causal mask attention       →  PagedAttention + KV cache
@@ -45,7 +45,7 @@ Sequential token generation        →  Continuous batching engine
 
 ## Architecture: Qwen3vLLM
 
-**File:** [`models/Qwen3/qwen3_vllm.py`](../models/Qwen3/qwen3_vllm.py)
+**File:** [`collections/qwen3/models/qwen3_vllm.py`](../collections/qwen3/models/qwen3_vllm.py)
 
 ### Class hierarchy
 
@@ -63,7 +63,7 @@ Each subclass is a one-liner that sets `MODEL_CFG` to the appropriate config dat
 
 ### Component mapping
 
-| Training (qwen3.py) | vLLM (qwen3_vllm.py) | Purpose |
+| Training (qwen3_dense.py) | vLLM (qwen3_vllm.py) | Purpose |
 |---|---|---|
 | `nn.Linear` (Q, K, V separate) | `QKVParallelLinear` | Fused Q/K/V projection, tensor-parallel ready |
 | `nn.Linear` (output proj) | `RowParallelLinear` | Row-parallel for multi-GPU |
@@ -141,7 +141,7 @@ merged_params_mapping = [
 
 ### 3. Custom name translation
 
-If weights use the custom qwen3.py naming (from merged `.pth` files), `_translate_custom_name()` converts them to HF convention before loading. See [MODEL.md — Naming Convention](MODEL.md#naming-convention) for the full mapping table.
+If weights use the custom qwen3_dense.py naming (from merged `.pth` files), `_translate_custom_name()` converts them to HF convention before loading. See [MODEL.md — Naming Convention](MODEL.md#naming-convention) for the full mapping table.
 
 ---
 
@@ -153,7 +153,7 @@ The inference notebook converts a merged `.pth` checkpoint to vLLM-compatible fo
 
 ```python
 convert_pth_to_vllm(
-    tokenizer=Qwen3Tokenizer("./models/Qwen3/tokenizer.json"),
+    tokenizer=Qwen3Tokenizer("./collections/qwen3/models/tokenizer.json"),
     model_cfg=QWEN_14B_CFG,
     pth_path="./logs/.../model_pretrained/00-0.2356-0.8897.pth",
     output_dir="./model_vllm",
@@ -195,7 +195,7 @@ convert_pth_to_vllm(
 
 ```python
 from vllm import ModelRegistry
-from models.Qwen3.qwen3_vllm import Qwen3_14B_vLLM
+from collections.qwen3.models.qwen3_vllm import Qwen3_14B_vLLM
 
 ModelRegistry.register_model("Qwen3vLLM", Qwen3_14B_vLLM)
 ```
