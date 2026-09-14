@@ -55,10 +55,10 @@ class CFG:
     BATCH_SIZE = 1
     VAL_BATCH_SIZE = 1
     GRAD_ACCUM = 16
-    MAX_SEQ_LEN = 256     # direct answers reach 249 tok, so nothing is truncated
+    MAX_SEQ_LEN = 512     # CoT samples reach 476 tok (train) / 434 tok (test), so nothing is truncated
 
     MODEL_SIZE = "14B"    # "0.6B" | "1.7B" | "4B" | "8B" | "14B" | "32B"
-    INCLUDE_THINKING = False  # False: predict \boxed{answer} directly | True: train on the chain of thought
+    INCLUDE_THINKING = True   # False: predict \boxed{answer} directly | True: train on the chain of thought
 
     RANK = 16
     ALPHA = 32
@@ -78,7 +78,9 @@ class CFG:
     # --- Periodic sample inference ---
     INFER_EVERY_PCT = 0.20    # sample the model every 20% of optimizer steps
     INFER_SAMPLES = 10        # held-out questions to print per round
-    INFER_MAX_NEW_TOKENS = 48 # direct \\boxed{} answers are short
+    # CoT + \\boxed{} ground truths run to 346 tok (p99 = 221); generation has no
+    # KV cache, so every extra token costs a full forward pass over the sequence.
+    INFER_MAX_NEW_TOKENS = 320 if INCLUDE_THINKING else 48
 
 
 # -----------------
@@ -587,16 +589,30 @@ class Qwen3_Lightning(pl.LightningModule):
 # --------------------
 
 def lightning_ai_ready():
-    """True when lightning.ai credentials exist.
+    """True when remote tracking can actually run: package + credentials.
 
     LitLogger falls back to an interactive browser login when unauthenticated,
     which blocks a headless run forever, so the credentials are checked before
     the logger is ever constructed.
+
+    The `litlogger` backend is imported lazily inside LitLogger.experiment, i.e.
+    from Trainer.fit — long after the base weights are on the GPU. A missing
+    package would therefore kill the run minutes in, so it is checked up front
+    and degrades to CSV exactly like missing credentials do.
     """
     import os
+    from importlib.util import find_spec
+
+    if find_spec("litlogger") is None:
+        print("[logger] `litlogger` is not installed "
+              "(`pip install litlogger` enables Lightning AI tracking).")
+        return False
     if os.environ.get("LIGHTNING_API_KEY") and os.environ.get("LIGHTNING_USER_ID"):
         return True
-    return (Path.home() / ".lightning" / "credentials.json").is_file()
+    if (Path.home() / ".lightning" / "credentials.json").is_file():
+        return True
+    print("[logger] No Lightning AI credentials found.")
+    return False
 
 
 # --------------------------
@@ -615,6 +631,23 @@ def normalize_answer(text):
     and a trailing period are formatting noise rather than a wrong answer.
     """
     return text.strip().replace(",", "").replace("$", "").rstrip(".").strip()
+
+
+THINK_CLOSE = "</think>"
+
+
+def split_thinking(completion):
+    """Split a thinking-mode completion into (thinking, answer_part, closed).
+
+    The prompt already ends with "<think>\n", so the model emits the chain of
+    thought first and is supposed to close it with </think> before the boxed
+    answer. closed is False when the tag never appeared — the reasoning either
+    ran past INFER_MAX_NEW_TOKENS or the model skipped the tag altogether.
+    """
+    if THINK_CLOSE in completion:
+        thinking, _, rest = completion.partition(THINK_CLOSE)
+        return thinking.strip(), rest.strip(), True
+    return completion.strip(), "", False
 
 
 def parse_boxed_answer(completion):
@@ -711,6 +744,7 @@ class SampleInferenceCallback(pl.Callback):
 
         n_correct = 0
         n_format = 0
+        n_think_closed = 0
         for i, rec in enumerate(self.samples, 1):
             prompt = format_prompt_only(
                 rec["question"], include_thinking=CFG.INCLUDE_THINKING
@@ -731,9 +765,26 @@ class SampleInferenceCallback(pl.Callback):
                 "",
                 f"[{i}/{len(self.samples)}] {status}",
                 f"question: {rec['question']}",
-                f"answer: {completion}",
-                f"expected: \\boxed{{{expected}}}",
             ]
+
+            if CFG.INCLUDE_THINKING:
+                # The chain of thought is what the model is being trained on now,
+                # so show it next to the reference reasoning rather than only the
+                # final boxed answer.
+                thinking, answer_part, think_closed = split_thinking(completion)
+                n_think_closed += think_closed
+                n_think_tok = len(self.tokenizer.encode(thinking)) if thinking else 0
+                lines += [
+                    f"think: ({n_think_tok} tok, "
+                    f"{'closed' if think_closed else 'UNCLOSED </think>'}): "
+                    f"{thinking if thinking else '<empty>'}",
+                    f"answer: {answer_part if answer_part else '<none after </think>>'}",
+                    f"expected_think: {rec['thinking']}",
+                ]
+            else:
+                lines.append(f"answer: {completion}")
+
+            lines.append(f"expected: \\boxed{{{expected}}}")
 
         n = max(1, len(self.samples))
         acc = 100.0 * n_correct / n
@@ -742,8 +793,13 @@ class SampleInferenceCallback(pl.Callback):
             "-" * 78,
             f"box_answer_match_accuracy: {n_correct}/{len(self.samples)} ({acc:.1f}%)",
             f"format_answer_matched_count: {n_format}/{len(self.samples)}",
-            bar,
         ]
+        if CFG.INCLUDE_THINKING:
+            lines.append(
+                f"think_closed_count: {n_think_closed}/{len(self.samples)} "
+                f"(max_new_tokens={self.max_new_tokens})"
+            )
+        lines.append(bar)
 
         report = "\n".join(lines)
         print("\n" + report + "\n", flush=True)
@@ -753,6 +809,9 @@ class SampleInferenceCallback(pl.Callback):
                           sync_dist=True, prog_bar=False)
             pl_module.log('Validation/format_answer_matched_count', float(n_format),
                           sync_dist=True, prog_bar=False)
+            if CFG.INCLUDE_THINKING:
+                pl_module.log('Validation/think_closed_count', float(n_think_closed),
+                              sync_dist=True, prog_bar=False)
         except Exception:
             pass  # logging is not available outside a training batch
 
@@ -802,8 +861,11 @@ if __name__ == '__main__':
     think_tag = "CoT" if CFG.INCLUDE_THINKING else "Direct"
     save_dir = f'./logs/2_Qwen3_{CFG.MODEL_SIZE}_Gsm8k_{think_tag}_{mode_tag}_r{CFG.RANK}_a{CFG.ALPHA}/'
 
-    # Experiment name: Qwen3_Gsm8k_<size>_<LoRA|QLoRA_bits>_<dd_mm_yyyy>
-    run_name = f'Qwen3_Gsm8k_{CFG.MODEL_SIZE}_{mode_tag}_{date}'
+    # Experiment name: Qwen3_Gsm8k_<size>_<LoRA|QLoRA_bits>[_think]_<dd_mm_yyyy>
+    # Chain-of-thought runs carry a _think suffix so they never land on top of
+    # the direct-answer experiments already tracked under the plain name.
+    think_suffix = "_think" if CFG.INCLUDE_THINKING else ""
+    run_name = f'Qwen3_Gsm8k_{CFG.MODEL_SIZE}_{mode_tag}{think_suffix}_{date}'
 
     # CSV stays as the local record — plot_training_curves() reads its metrics.csv
     csv_logger = pl.loggers.CSVLogger(save_dir=save_dir, name=f'{date}')
@@ -814,11 +876,12 @@ if __name__ == '__main__':
     # blocks a long training run.
     if not lightning_ai_ready():
         print("=" * 78)
-        print("[logger] Lightning AI: no credentials found — remote tracking is OFF.")
+        print("[logger] Lightning AI: remote tracking is OFF (reason above).")
         print("[logger] Logging locally to CSV instead:")
         print(f"[logger]   {save_dir}")
-        print("[logger] To turn remote tracking on, run `lightning login` (or set")
-        print("[logger] LIGHTNING_API_KEY + LIGHTNING_USER_ID), then restart training.")
+        print("[logger] To turn remote tracking on, install `litlogger` and run")
+        print("[logger] `lightning login` (or set LIGHTNING_API_KEY +")
+        print("[logger] LIGHTNING_USER_ID), then restart training.")
         print("=" * 78)
     else:
         lit_logger = pl.loggers.LitLogger(
