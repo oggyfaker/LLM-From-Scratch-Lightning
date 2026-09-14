@@ -184,8 +184,8 @@ class MoELoRAMergeCheckpoint(_PL_CALLBACK_BASE):
     """
 
     def __init__(self, tokenizer,
-                 monitor='val_mean_token_accuracy', mode='max', save_top_k=3,
-                 filename_template='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}'):
+                 monitor='Validation/accuracy', mode='max', save_top_k=3,
+                 filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}'):
         super().__init__()
         self.tokenizer = tokenizer
         self.monitor = monitor
@@ -314,8 +314,8 @@ class NemotronLoRAMergeCheckpoint(_PL_CALLBACK_BASE):
     """
 
     def __init__(self, tokenizer,
-                 monitor='val_mean_token_accuracy', mode='max', save_top_k=1,
-                 filename_template='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}'):
+                 monitor='Validation/accuracy', mode='max', save_top_k=1,
+                 filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}'):
         super().__init__()
         self.tokenizer = tokenizer
         self.monitor = monitor

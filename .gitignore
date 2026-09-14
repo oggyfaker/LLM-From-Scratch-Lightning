@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# Python bytecode / build artefacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+*.manifest
+*.spec
+
+# ---------------------------------------------------------------------------
+# Model weights — downloaded bases and trained outputs
+#
+# from_pretrained() writes to <cwd>/checkpoint/<model>/, so every collection
+# model folder grows its own multi-GB checkpoint/ directory.
+# ---------------------------------------------------------------------------
+checkpoint/
+collections/*/checkpoint/
+collections/*/*/checkpoint/
+model_pretrained/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+
+# ---------------------------------------------------------------------------
+# Lightning / experiment tracking output
+# ---------------------------------------------------------------------------
+logs/
+lightning_logs/
+training_logs/
+collections/*/logs/
+collections/*/lightning_logs/
+collections/*/training_logs/
+*.log
+nohup.out
+
+# Other trackers, in case they get used later
+wandb/
+mlruns/
+.neptune/
+runs/
+outputs/
+
+# ---------------------------------------------------------------------------
+# Credentials — never commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.lightning/
+lightning_credentials.json
+*.pem
+*.key
+secrets.json
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.conda/
+
+# ---------------------------------------------------------------------------
+# Notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ---------------------------------------------------------------------------
+# Tooling caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Misc runtime junk
+# ---------------------------------------------------------------------------
+core
+core.*
+*.tmp
+tmp/

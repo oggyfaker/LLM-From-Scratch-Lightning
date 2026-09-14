@@ -68,8 +68,8 @@ class LoRAMergeCheckpoint(pl.Callback):
     directly into a vanilla Qwen3Model.
     """
 
-    def __init__(self, monitor='val_mean_token_accuracy', mode='max', save_top_k=3,
-                 filename_template='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}'):
+    def __init__(self, monitor='Validation/accuracy', mode='max', save_top_k=3,
+                 filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}'):
         super().__init__()
         self.monitor = monitor
         self.mode = mode
@@ -142,15 +142,15 @@ def plot_training_curves(logger):
     metrics_path = os.path.join(logger.log_dir, "metrics.csv")
     metrics = pd.read_csv(metrics_path)
 
-    train_df_plot = metrics[["step", "train_loss"]].dropna().reset_index(drop=True)
-    val_df_plot = metrics[["step", "total_val_loss"]].dropna().reset_index(drop=True)
-    val_acc_df = metrics[["step", "val_mean_token_accuracy"]].dropna().reset_index(drop=True)
+    train_df_plot = metrics[["step", "Training/train_loss"]].dropna().reset_index(drop=True)
+    val_df_plot = metrics[["step", "Validation/loss"]].dropna().reset_index(drop=True)
+    val_acc_df = metrics[["step", "Validation/accuracy"]].dropna().reset_index(drop=True)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
 
     # Loss
-    ax1.plot(train_df_plot["step"], train_df_plot["train_loss"],
+    ax1.plot(train_df_plot["step"], train_df_plot["Training/train_loss"],
             linewidth=1, alpha=0.8, label="Train Loss (per step)")
-    ax1.plot(val_df_plot["step"], val_df_plot["total_val_loss"],
+    ax1.plot(val_df_plot["step"], val_df_plot["Validation/loss"],
             marker="s", markersize=5, linewidth=1.5, label="Val Loss")
     ax1.set_xlabel("Step")
     ax1.set_ylabel("Loss")
@@ -160,7 +160,7 @@ def plot_training_curves(logger):
 
     # Val Mean Token Accuracy
     if not val_acc_df.empty:
-        ax2.plot(val_acc_df["step"], val_acc_df["val_mean_token_accuracy"],
+        ax2.plot(val_acc_df["step"], val_acc_df["Validation/accuracy"],
                 marker="s", markersize=5, linewidth=1.5, label="Val Token Acc")
     ax2.set_xlabel("Step")
     ax2.set_ylabel("Accuracy")

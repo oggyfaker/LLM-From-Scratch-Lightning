@@ -1,5 +1,7 @@
 import sys
 import math
+import random
+import re
 import bitsandbytes as bnb
 from pathlib import Path
 from functools import partial
@@ -19,7 +21,7 @@ sys.path.append(str(COLLECTIONS_DIR))
 sys.path.append(str(MODELS_DIR))
 
 from data.Gsm8k.data_utils import (
-    load_gsm8k_json, Gsm8kDataset, custom_collate_fn
+    load_gsm8k_json, Gsm8kDataset, custom_collate_fn, format_prompt_only
 )
 from utils.checkpoint_utils import (
     LoRAMergeCheckpoint, plot_training_curves,
@@ -69,6 +71,14 @@ class CFG:
     MIN_LR = LR * 0.1
     GRAD_NORM = 1.0
     WARMUP_STEPS = 20      # ~10% of total optimizer steps for linear warmup
+
+    # --- Experiment tracking (Lightning AI) ---
+    TEAMSPACE = "LLM-From-Scratch"   # lightning.ai teamspace holding the experiments
+
+    # --- Periodic sample inference ---
+    INFER_EVERY_PCT = 0.20    # sample the model every 20% of optimizer steps
+    INFER_SAMPLES = 10        # held-out questions to print per round
+    INFER_MAX_NEW_TOKENS = 48 # direct \\boxed{} answers are short
 
 
 # -----------------
@@ -313,6 +323,8 @@ class Qwen3_Lightning(pl.LightningModule):
         # 1. Gradient accumulation accumulators
         self._accum_loss = 0.0
         self._accum_tokens = 0
+        self._opt_step = 0   # completed optimizer steps (manual optimization)
+        self._total_tokens_trained = 0  # cumulative answer tokens with loss
 
         # 2. Store validation step losses & accuracy
         self.val_step_losses = []
@@ -402,6 +414,7 @@ class Qwen3_Lightning(pl.LightningModule):
         """
         # 0. Scale gradients by 1/M → correct full-batch normalization
         M = self._accum_tokens
+        self._total_tokens_trained += M
         for p in self.parameters():
             if p.requires_grad and p.grad is not None:
                 p.grad.div_(M)
@@ -413,21 +426,39 @@ class Qwen3_Lightning(pl.LightningModule):
         opt.step()
         opt.zero_grad()
         sch.step()
+        self._opt_step += 1
 
         # 3. Final loss = total_loss_sum / total_tokens
         train_loss = self._accum_loss / M
 
-        # 4. Log
-        if from_epoch_end:
-            self.log('train_loss', train_loss,
-                sync_dist=True, prog_bar=True, on_step=False, on_epoch=True)
-            self.log('grad_norm', grad_norm.item(),
-                sync_dist=True, prog_bar=False, on_step=False, on_epoch=True)
-        else:
-            self.log('train_loss', train_loss,
-                sync_dist=True, prog_bar=True, on_step=True, on_epoch=False)
-            self.log('grad_norm', grad_norm.item(),
-                sync_dist=True, prog_bar=False, on_step=True, on_epoch=False)
+        # 4. Log — loss, LR, grad-norm, throughput and memory
+        on_step = not from_epoch_end
+        on_epoch = from_epoch_end
+
+        # Learning rate actually applied this step (group 0 = LoRA A / base LR)
+        lr_now = opt.param_groups[0]['lr']
+
+        gpu_mem_gb = (
+            torch.cuda.max_memory_allocated() / 1024 ** 3
+            if torch.cuda.is_available() else 0.0
+        )
+
+        self.log('Training/train_loss', train_loss,
+            sync_dist=True, prog_bar=True, on_step=on_step, on_epoch=on_epoch)
+
+        extra = {
+            'Training/lr': lr_now,
+            'Training/grad_norm': grad_norm.item(),
+            'Training/gpu_mem_gb': gpu_mem_gb,
+            # Cumulative answer tokens the model has actually computed loss on
+            'Training/number_token_trained': float(self._total_tokens_trained),
+        }
+        # LoRA+ runs a second LR for the B matrices — worth tracking separately
+        if CFG.LORAPLUS_RATIO is not None and len(opt.param_groups) > 1:
+            extra['Training/lr_lora_B'] = opt.param_groups[1]['lr']
+
+        self.log_dict(extra, sync_dist=True, prog_bar=False,
+            on_step=on_step, on_epoch=on_epoch)
 
         # 5. Reset accumulators
         self._accum_loss = 0.0
@@ -466,13 +497,13 @@ class Qwen3_Lightning(pl.LightningModule):
         stacked = torch.stack(self.val_step_losses)
         valid = stacked[~torch.isnan(stacked)]
         avg_val_loss = valid.mean() if valid.numel() > 0 else torch.tensor(0.0)
-        self.log('total_val_loss', avg_val_loss, sync_dist=True, prog_bar=True)
+        self.log('Validation/loss', avg_val_loss, sync_dist=True, prog_bar=True)
 
         # Mean_token_accuracy (weighted by token count)
         total_weighted = sum(self.val_step_accuracies)
         total_tokens = sum(self.val_step_token_counts)
         val_token_acc = total_weighted / total_tokens if total_tokens > 0 else 0.0
-        self.log('val_mean_token_accuracy', val_token_acc, sync_dist=True, prog_bar=True)
+        self.log('Validation/accuracy', val_token_acc, sync_dist=True, prog_bar=True)
 
         # Clear cache
         self.val_step_losses.clear()
@@ -551,6 +582,184 @@ class Qwen3_Lightning(pl.LightningModule):
         return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
 
 
+# --------------------
+# LIGHTNING AI LOGGING
+# --------------------
+
+def lightning_ai_ready():
+    """True when lightning.ai credentials exist.
+
+    LitLogger falls back to an interactive browser login when unauthenticated,
+    which blocks a headless run forever, so the credentials are checked before
+    the logger is ever constructed.
+    """
+    import os
+    if os.environ.get("LIGHTNING_API_KEY") and os.environ.get("LIGHTNING_USER_ID"):
+        return True
+    return (Path.home() / ".lightning" / "credentials.json").is_file()
+
+
+# --------------------------
+# ANSWER FORMAT / CORRECTNESS
+# --------------------------
+
+# A well-formed boxed answer: literal \boxed{...} with no nested braces.
+# Rejects "\boxed{" (unclosed), "boxed{5}" (no backslash) and "\boxed{}" (empty).
+BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
+
+
+def normalize_answer(text):
+    """Canonical form for comparing a predicted answer to the ground truth.
+
+    GSM8K answers are plain numbers, so thousands separators, currency symbols
+    and a trailing period are formatting noise rather than a wrong answer.
+    """
+    return text.strip().replace(",", "").replace("$", "").rstrip(".").strip()
+
+
+def parse_boxed_answer(completion):
+    """Split a completion into (format_ok, answer_text).
+
+    format_ok is True only when a well-formed \boxed{...} carrying non-empty
+    content is present — independent of whether that content is correct.
+    """
+    match = BOXED_RE.search(completion)
+    if match is None:
+        return False, None
+    content = match.group(1).strip()
+    if not content:
+        return False, None
+    return True, content
+
+
+# --------------------------
+# PERIODIC SAMPLE INFERENCE
+# --------------------------
+
+class SampleInferenceCallback(pl.Callback):
+    """Print `question:` / `answer:` pairs for held-out problems during training.
+
+    Fires every ``every_pct`` of the planned optimizer steps (0.20 -> at
+    20/40/60/80/100%) so answer quality can be watched as the run progresses.
+    Greedy decoding; only the newly generated tokens are decoded, so the prompt
+    is never echoed back.
+    """
+
+    def __init__(self, tokenizer, records, num_samples, every_pct,
+                 max_new_tokens, total_steps, seed=CFG.SEED):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_new_tokens = max_new_tokens
+        self.total_steps = max(1, total_steps)
+        self.every = max(1, int(round(self.total_steps * every_pct)))
+        self.samples = random.Random(seed).sample(
+            records, min(num_samples, len(records))
+        )
+        self._fired = set()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = pl_module._opt_step
+        if step == 0 or step % self.every != 0 or step in self._fired:
+            return
+        self._fired.add(step)
+        self._run(pl_module, step)
+
+    def on_train_end(self, trainer, pl_module):
+        # Final round, unless a boundary already fired close to the end
+        step = pl_module._opt_step
+        if step <= 0 or step in self._fired:
+            return
+        if self._fired and (step - max(self._fired)) < self.every // 2:
+            return
+        self._fired.add(step)
+        self._run(pl_module, step)
+
+    @torch.no_grad()
+    def _generate(self, model, prompt):
+        device = next(model.parameters()).device
+        x = torch.tensor([self.tokenizer.encode(prompt)],
+                         dtype=torch.long, device=device)
+        eos = self.tokenizer.eos_token_id
+        new_ids = []
+        # The Trainer runs the forward pass under AMP autocast. The 4-bit base
+        # layers compute in bfloat16 while the LoRA adapters stay fp32, so the
+        # same autocast is required here or the matmuls disagree on dtype.
+        use_amp = device.type == 'cuda'
+        for _ in range(self.max_new_tokens):
+            with torch.autocast(device_type=device.type,
+                                dtype=torch.bfloat16, enabled=use_amp):
+                logits = model(x)
+            next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # greedy
+            if next_id.item() == eos:
+                break
+            new_ids.append(next_id.item())
+            x = torch.cat([x, next_id], dim=1)
+        return self.tokenizer.decode(new_ids).strip()
+
+    def _run(self, pl_module, step):
+        model = pl_module.model
+        was_training = model.training
+        model.eval()
+
+        pct = 100.0 * step / self.total_steps
+        bar = "=" * 78
+        lines = [
+            bar,
+            f"SAMPLE INFERENCE  |  step {step}/{self.total_steps}  ({pct:.0f}% of training)",
+            bar,
+        ]
+
+        n_correct = 0
+        n_format = 0
+        for i, rec in enumerate(self.samples, 1):
+            prompt = format_prompt_only(
+                rec["question"], include_thinking=CFG.INCLUDE_THINKING
+            )
+            try:
+                completion = self._generate(model, prompt)
+            except Exception as e:
+                completion = f"<generation failed: {type(e).__name__}: {e}>"
+
+            expected = rec["answer"]
+            format_ok, predicted = parse_boxed_answer(completion)
+            hit = format_ok and normalize_answer(predicted) == normalize_answer(expected)
+            n_correct += hit
+            n_format += format_ok
+
+            status = "CORRECT" if hit else ("wrong" if format_ok else "BAD FORMAT")
+            lines += [
+                "",
+                f"[{i}/{len(self.samples)}] {status}",
+                f"question: {rec['question']}",
+                f"answer: {completion}",
+                f"expected: \\boxed{{{expected}}}",
+            ]
+
+        n = max(1, len(self.samples))
+        acc = 100.0 * n_correct / n
+        lines += [
+            "",
+            "-" * 78,
+            f"box_answer_match_accuracy: {n_correct}/{len(self.samples)} ({acc:.1f}%)",
+            f"format_answer_matched_count: {n_format}/{len(self.samples)}",
+            bar,
+        ]
+
+        report = "\n".join(lines)
+        print("\n" + report + "\n", flush=True)
+
+        try:
+            pl_module.log('Validation/box_answer_match_accuracy', acc,
+                          sync_dist=True, prog_bar=False)
+            pl_module.log('Validation/format_answer_matched_count', float(n_format),
+                          sync_dist=True, prog_bar=False)
+        except Exception:
+            pass  # logging is not available outside a training batch
+
+        if was_training:
+            model.train()
+
+
 if __name__ == '__main__':
 
     # ---- Data Preparation (train.json trains, test.json validates)
@@ -561,6 +770,13 @@ if __name__ == '__main__':
 
     CFG.STEPS = (len(train_records) // CFG.BATCH_SIZE // CFG.GRAD_ACCUM) * CFG.EPOCHS
     print(f"Optimizer steps per epoch: {CFG.STEPS}")
+
+    # Validate on the FULL test set at the same 20% marks as the sample rounds.
+    # val_check_interval counts training batches, so convert optimizer steps back
+    # to batches with GRAD_ACCUM.
+    CFG.VAL_EVERY_N_BATCHES = CFG.GRAD_ACCUM * max(1, round(CFG.STEPS * CFG.INFER_EVERY_PCT))
+    print(f"Validation every {CFG.VAL_EVERY_N_BATCHES} batches "
+          f"({CFG.INFER_EVERY_PCT:.0%} of training)")
 
     # ---- Model & Tokenizer
     model_cfg, repo_id = QWEN3_MODELS[CFG.MODEL_SIZE]
@@ -584,39 +800,99 @@ if __name__ == '__main__':
     date = datetime.now().strftime("%d_%m_%Y")
     mode_tag = "LoRA" if CFG.TUNING_MODE == "lora" else f"QLoRA_{CFG.QUANT_BITS}"
     think_tag = "CoT" if CFG.INCLUDE_THINKING else "Direct"
-    logger = pl.loggers.CSVLogger(
-        save_dir=f'./logs/2_Qwen3_{CFG.MODEL_SIZE}_Gsm8k_{think_tag}_{mode_tag}_r{CFG.RANK}_a{CFG.ALPHA}/',
-        name=f'{date}'
-    )
+    save_dir = f'./logs/2_Qwen3_{CFG.MODEL_SIZE}_Gsm8k_{think_tag}_{mode_tag}_r{CFG.RANK}_a{CFG.ALPHA}/'
+
+    # Experiment name: Qwen3_Gsm8k_<size>_<LoRA|QLoRA_bits>_<dd_mm_yyyy>
+    run_name = f'Qwen3_Gsm8k_{CFG.MODEL_SIZE}_{mode_tag}_{date}'
+
+    # CSV stays as the local record — plot_training_curves() reads its metrics.csv
+    csv_logger = pl.loggers.CSVLogger(save_dir=save_dir, name=f'{date}')
+    loggers = [csv_logger]
+
+    # Lightning AI remote tracking (needs `lightning login` or LIGHTNING_API_KEY
+    # + LIGHTNING_USER_ID). Falls back to CSV-only so a missing login never
+    # blocks a long training run.
+    if not lightning_ai_ready():
+        print("=" * 78)
+        print("[logger] Lightning AI: no credentials found — remote tracking is OFF.")
+        print("[logger] Logging locally to CSV instead:")
+        print(f"[logger]   {save_dir}")
+        print("[logger] To turn remote tracking on, run `lightning login` (or set")
+        print("[logger] LIGHTNING_API_KEY + LIGHTNING_USER_ID), then restart training.")
+        print("=" * 78)
+    else:
+        lit_logger = pl.loggers.LitLogger(
+            name=run_name,
+            teamspace=CFG.TEAMSPACE,
+            # Lightning's wrapper defaults save_logs=True, which makes litlogger
+            # re-exec this whole script inside a PTY to capture terminal output
+            # (litlogger/experiment.py:112). The parent then blocks holding its
+            # GPU memory while the child trains — two 14B models do not fit, so
+            # console capture stays off.
+            save_logs=False,
+            metadata={
+                'model': f'Qwen3-{CFG.MODEL_SIZE}',
+                'dataset': 'gsm8k',
+                'tuning_mode': CFG.TUNING_MODE,
+                'quant_bits': str(CFG.QUANT_BITS),
+                'rank': str(CFG.RANK),
+                'alpha': str(CFG.ALPHA),
+                'lr': str(CFG.LR),
+                'grad_accum': str(CFG.GRAD_ACCUM),
+                'max_seq_len': str(CFG.MAX_SEQ_LEN),
+                'include_thinking': str(CFG.INCLUDE_THINKING),
+            },
+        )
+        # Append, never insert: trainer.logger is loggers[0] and decides where
+        # the checkpoint callbacks write. CSVLogger must stay first.
+        loggers.append(lit_logger)
+        print(f"[logger] Lightning AI tracking enabled")
+        print(f"[logger]   teamspace: {CFG.TEAMSPACE}")
+        print(f"[logger]   experiment: {run_name}")
 
     # ---- Checkpoint callback (full .ckpt for resuming training)
     ckpt = pl.callbacks.ModelCheckpoint(
-        monitor='val_mean_token_accuracy',
-        save_top_k=3,
-        save_last=True,
+        monitor='Validation/accuracy',
+        # Disk-bound: validation now runs 5x, and each .ckpt is ~9.5GB while each
+        # merged .pth is ~52GB. Keep only the single best of each.
+        save_top_k=1,
+        save_last=False,
         save_weights_only=True,
-        filename='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}',
+        filename='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}',
+        # '/' in a metric name would become a directory separator when Lightning
+        # auto-inserts "name=value" into the filename, so insert values only.
+        auto_insert_metric_name=False,
         mode='max',
         save_on_train_epoch_end=True,   # save at epoch end
     )
 
     # ---- Merged model callback (LoRA → base .pth for direct Qwen3Model loading)
     merged_ckpt = LoRAMergeCheckpoint(
-        monitor='val_mean_token_accuracy',
+        monitor='Validation/accuracy',
         mode='max',
-        save_top_k=3,
-        filename_template='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}',
+        save_top_k=1,
+        filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}',
+    )
+
+    # ---- Periodic sample inference (every 20% of training, 20 held-out questions)
+    sample_infer = SampleInferenceCallback(
+        tokenizer=tokenizer,
+        records=val_records,
+        num_samples=CFG.INFER_SAMPLES,
+        every_pct=CFG.INFER_EVERY_PCT,
+        max_new_tokens=CFG.INFER_MAX_NEW_TOKENS,
+        total_steps=CFG.STEPS,
     )
 
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=[0],
-        callbacks=[ckpt, merged_ckpt],
-        logger=logger,
+        callbacks=[ckpt, merged_ckpt, sample_infer],
+        logger=loggers,
         max_epochs=CFG.EPOCHS,
         precision='bf16',
-        # val_check_interval=500, # validate every 100 training steps (1767 is total steps of epoch)
-        check_val_every_n_epoch=True,
+        val_check_interval=CFG.VAL_EVERY_N_BATCHES,  # full test set every 20%
+        check_val_every_n_epoch=1,
         log_every_n_steps=1,
         num_sanity_val_steps=0,
     )
@@ -624,4 +900,5 @@ if __name__ == '__main__':
     trainer.fit(model=qwen3_module, datamodule=datamodule)
 
     # ---- Plot Results ----
-    plot_training_curves(logger)
+    plot_training_curves(csv_logger)
+

@@ -72,6 +72,9 @@ class CFG:
     WARMUP_STEPS = 20      # ~10% of total optimizer steps for linear warmup
     LORAPLUS_RATIO = None #4.0  # LR_B = LR_A*ratio, If use LoRA+, set base lr smaller(like 7.5e-5) or decrease ratio (4.0 or 8.0) (None to disable LoRA+)
 
+    # --- Experiment tracking (Lightning AI) ---
+    TEAMSPACE = "LLM-From-Scratch"   # lightning.ai teamspace holding the experiments
+
 
 # -----------------
 # LOW-RANK ADAPTION
@@ -417,14 +420,14 @@ class Qwen3_Lightning(pl.LightningModule):
 
         # 4. Log
         if from_epoch_end:
-            self.log('train_loss', train_loss,
+            self.log('Training/train_loss', train_loss,
                 sync_dist=True, prog_bar=True, on_step=False, on_epoch=True)
-            self.log('grad_norm', grad_norm.item(),
+            self.log('Training/grad_norm', grad_norm.item(),
                 sync_dist=True, prog_bar=False, on_step=False, on_epoch=True)
         else:
-            self.log('train_loss', train_loss,
+            self.log('Training/train_loss', train_loss,
                 sync_dist=True, prog_bar=True, on_step=True, on_epoch=False)
-            self.log('grad_norm', grad_norm.item(),
+            self.log('Training/grad_norm', grad_norm.item(),
                 sync_dist=True, prog_bar=False, on_step=True, on_epoch=False)
 
         # 5. Reset accumulators
@@ -464,13 +467,13 @@ class Qwen3_Lightning(pl.LightningModule):
         stacked = torch.stack(self.val_step_losses)
         valid = stacked[~torch.isnan(stacked)]
         avg_val_loss = valid.mean() if valid.numel() > 0 else torch.tensor(0.0)
-        self.log('total_val_loss', avg_val_loss, sync_dist=True, prog_bar=True)
+        self.log('Validation/loss', avg_val_loss, sync_dist=True, prog_bar=True)
 
         # Mean_token_accuracy (weighted by token count)
         total_weighted = sum(self.val_step_accuracies)
         total_tokens = sum(self.val_step_token_counts)
         val_token_acc = total_weighted / total_tokens if total_tokens > 0 else 0.0
-        self.log('val_mean_token_accuracy', val_token_acc, sync_dist=True, prog_bar=True)
+        self.log('Validation/accuracy', val_token_acc, sync_dist=True, prog_bar=True)
 
         # Clear cache
         self.val_step_losses.clear()
@@ -549,6 +552,23 @@ class Qwen3_Lightning(pl.LightningModule):
         return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
 
 
+# --------------------
+# LIGHTNING AI LOGGING
+# --------------------
+
+def lightning_ai_ready():
+    """True when lightning.ai credentials exist.
+
+    LitLogger falls back to an interactive browser login when unauthenticated,
+    which blocks a headless run forever, so the credentials are checked before
+    the logger is ever constructed.
+    """
+    import os
+    if os.environ.get("LIGHTNING_API_KEY") and os.environ.get("LIGHTNING_USER_ID"):
+        return True
+    return (Path.home() / ".lightning" / "credentials.json").is_file()
+
+
 if __name__ == '__main__':
 
     # ---- Data Preparation
@@ -579,35 +599,81 @@ if __name__ == '__main__':
     from datetime import datetime
     date = datetime.now().strftime("%d_%m_%Y")
     mode_tag = "LoRA" if CFG.TUNING_MODE == "lora" else f"QLoRA_{CFG.QUANT_BITS}"
-    logger = pl.loggers.CSVLogger(
-        save_dir=f'./logs/0_Qwen3_{CFG.MODEL_SIZE}_Jigsaw_{mode_tag}_r{CFG.RANK}_a{CFG.ALPHA}/',
-        name=f'{date}'
-    )
+    save_dir = f'./logs/0_Qwen3_{CFG.MODEL_SIZE}_Jigsaw_{mode_tag}_r{CFG.RANK}_a{CFG.ALPHA}/'
+
+    # Experiment name: Qwen3_<dataset>_<size>_<LoRA|QLoRA_bits>_<dd_mm_yyyy>
+    run_name = f'Qwen3_Jigsaw_{CFG.MODEL_SIZE}_{mode_tag}_{date}'
+
+    # CSV stays as the local record — plot_training_curves() reads its metrics.csv
+    csv_logger = pl.loggers.CSVLogger(save_dir=save_dir, name=f'{date}')
+    loggers = [csv_logger]
+
+    # Lightning AI remote tracking (needs `lightning login` or LIGHTNING_API_KEY
+    # + LIGHTNING_USER_ID). Falls back to CSV-only so a missing login never
+    # blocks a long training run.
+    if not lightning_ai_ready():
+        print("=" * 78)
+        print("[logger] Lightning AI: no credentials found — remote tracking is OFF.")
+        print("[logger] Logging locally to CSV instead:")
+        print(f"[logger]   {save_dir}")
+        print("[logger] To turn remote tracking on, run `lightning login` (or set")
+        print("[logger] LIGHTNING_API_KEY + LIGHTNING_USER_ID), then restart training.")
+        print("=" * 78)
+    else:
+        lit_logger = pl.loggers.LitLogger(
+            name=run_name,
+            teamspace=CFG.TEAMSPACE,
+            # Lightning's wrapper defaults save_logs=True, which makes litlogger
+            # re-exec this whole script inside a PTY to capture terminal output
+            # (litlogger/experiment.py:112). The parent then blocks holding its
+            # GPU memory while the child trains — two models do not fit, so
+            # console capture stays off.
+            save_logs=False,
+            metadata={
+                'model': f'Qwen3-{CFG.MODEL_SIZE}',
+                'dataset': 'jigsaw2026',
+                'tuning_mode': CFG.TUNING_MODE,
+                'quant_bits': str(CFG.QUANT_BITS),
+                'rank': str(CFG.RANK),
+                'alpha': str(CFG.ALPHA),
+                'lr': str(CFG.LR),
+                'grad_accum': str(CFG.GRAD_ACCUM),
+            },
+        )
+        # Append, never insert: trainer.logger is loggers[0] and decides where
+        # the checkpoint callbacks write. CSVLogger must stay first.
+        loggers.append(lit_logger)
+        print(f"[logger] Lightning AI tracking enabled")
+        print(f"[logger]   teamspace: {CFG.TEAMSPACE}")
+        print(f"[logger]   experiment: {run_name}")
 
     # ---- Checkpoint callback (full .ckpt for resuming training)
     ckpt = pl.callbacks.ModelCheckpoint(
-        monitor='val_mean_token_accuracy',
+        monitor='Validation/accuracy',
         save_top_k=3,
         save_last=True,
         save_weights_only=True,
-        filename='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}',
+        filename='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}',
+        # '/' in a metric name would become a directory separator when Lightning
+        # auto-inserts "name=value" into the filename, so insert values only.
+        auto_insert_metric_name=False,
         mode='max',
         save_on_train_epoch_end=True,   # save at epoch end
     )
 
     # ---- Merged model callback (LoRA → base .pth for direct Qwen3Model loading)
     merged_ckpt = LoRAMergeCheckpoint(
-        monitor='val_mean_token_accuracy',
+        monitor='Validation/accuracy',
         mode='max',
         save_top_k=3,
-        filename_template='{epoch:02d}-{total_val_loss:.4f}-{val_mean_token_accuracy:.4f}',
+        filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}',
     )
 
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=[0],
         callbacks=[ckpt, merged_ckpt],
-        logger=logger,
+        logger=loggers,
         max_epochs=CFG.EPOCHS,
         precision='bf16',
         # val_check_interval=500, # validate every 100 training steps (1767 is total steps of epoch)
@@ -619,4 +685,5 @@ if __name__ == '__main__':
     trainer.fit(model=qwen3_module, datamodule=datamodule)
 
     # ---- Plot Results ----
-    plot_training_curves(logger)
+    plot_training_curves(csv_logger)
+
