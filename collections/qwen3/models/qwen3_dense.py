@@ -102,6 +102,43 @@ class FeedForward(nn.Module):
         return self.fc3(x)
 
 
+
+# ------- KV Cache (inference only) -------
+class KVCache:
+    """Per-layer key/value store that turns generation from O(T^2) into O(T).
+
+    Without it every new token re-runs a forward pass over the whole sequence,
+    so decoding 768 tokens costs 768 full-sequence forwards. That is why the old
+    10-question probe was all the training loop could afford; scoring the full
+    1319-question GSM8K test set that way would take ~14 h per round.
+
+    Training never constructs one: ``Qwen3Model.forward(x)`` leaves ``cache=None``
+    and runs exactly the full-sequence path it always has.
+
+    Keys/values are stored BEFORE the GQA head expansion (``n_kv_groups``, not
+    ``n_heads``) -- 5x smaller for Qwen3-14B (8 groups vs 40 heads).
+    """
+
+    def __init__(self, n_layers):
+        self.keys = [None] * n_layers
+        self.values = [None] * n_layers
+
+    def get(self, layer_idx):
+        return self.keys[layer_idx], self.values[layer_idx]
+
+    def update(self, layer_idx, keys, values):
+        self.keys[layer_idx] = keys
+        self.values[layer_idx] = values
+
+    @property
+    def seq_len(self):
+        return 0 if self.keys[0] is None else self.keys[0].shape[2]
+
+    def reset(self):
+        self.keys = [None] * len(self.keys)
+        self.values = [None] * len(self.values)
+
+
 # ------- Group Query Attention (GQA) -------
 class GroupedQueryAttention(nn.Module):
     '''The facts 
@@ -150,7 +187,17 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.q_norm = self.k_norm = None
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0, pad_mask=None):
+        """
+        cache/start_pos/pad_mask are inference-only and default to the training
+        behaviour. With all three at their defaults this is the original
+        full-sequence causal attention, unchanged.
+
+        start_pos: absolute position of x[:, 0]. RoPE is relative, so a whole
+            left-padded row may be shifted by its pad count without changing any
+            score -- only differences of positions ever reach the softmax.
+        pad_mask: (b, total_keys) bool, True where a slot is left-padding.
+        """
         b, num_tokens, _ = x.shape
 
         queries = self.W_query(x)
@@ -166,26 +213,74 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm:
             keys = self.k_norm(keys)
 
-        queries = apply_rope(queries, cos, sin)
-        keys = apply_rope(keys, cos, sin)
+        queries = apply_rope(queries, cos, sin, offset=start_pos)
+        keys = apply_rope(keys, cos, sin, offset=start_pos)
 
-        # Expand K and V to match number of heads
-        keys = keys.repeat_interleave(self.group_size, dim=1)
-        values = values.repeat_interleave(self.group_size, dim=1)
+        # --- Prepend the positions already decoded (inference only) ---
+        if cache is not None:
+            past_k, past_v = cache.get(layer_idx)
+            if past_k is not None:
+                keys = torch.cat([past_k, keys], dim=2)
+                values = torch.cat([past_v, values], dim=2)
+            cache.update(layer_idx, keys, values)
 
-        # --- Causal mask computed here inside GQA ---
-        mask = torch.triu(
-            torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool),
-            diagonal=1
-        )
-        mask = mask[None, None, :, :]  # (1, 1, num_tokens, num_tokens)
+        if cache is None and pad_mask is None:
+            # ---------------- Training path (unchanged) ----------------
+            # Expand K and V to match number of heads
+            keys = keys.repeat_interleave(self.group_size, dim=1)
+            values = values.repeat_interleave(self.group_size, dim=1)
 
-        attn_scores = queries @ keys.transpose(2, 3)
+            attn_scores = queries @ keys.transpose(2, 3)
+
+            # --- Causal mask computed here inside GQA ---
+            mask = torch.triu(
+                torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool),
+                diagonal=1
+            )
+            mask = mask[None, None, :, :]  # (1, 1, num_tokens, num_tokens)
+
+            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+
+            context = (attn_weights @ values).transpose(1, 2)
+            context = context.reshape(b, num_tokens, self.d_out)
+            return self.out_proj(context)
+
+        # ---------------- Generation path ----------------
+        # repeat_interleave would copy K and V out to n_heads on EVERY layer of
+        # EVERY decode step. At batch 128 / 985 cached positions that is ~124 GB
+        # of memory traffic per step -- more than the 4-bit weight dequant it is
+        # supposed to be hiding behind. Broadcasting over the group axis instead
+        # reads each cached K/V exactly once and allocates nothing.
+        #   queries (b, n_heads, Tq, hd) -> (b, n_kv, group_size, Tq, hd)
+        #   keys    (b, n_kv,    Tk, hd) -> (b, n_kv, 1,          Tk, hd)
+        # Head h of group g is h = g * group_size + s, which is exactly the
+        # layout repeat_interleave produces, so the two paths agree.
+        total_keys = keys.shape[2]
+        q = queries.view(b, self.num_kv_groups, self.group_size, num_tokens, self.head_dim)
+        attn_scores = q @ keys.unsqueeze(2).transpose(-2, -1)   # (b, g, gs, Tq, Tk)
+
+        # Keys run 0..total_keys-1 while queries start at start_pos, so the
+        # triangle has to be built from absolute positions.
+        q_pos = torch.arange(start_pos, start_pos + num_tokens, device=x.device)
+        k_pos = torch.arange(total_keys, device=x.device)
+        mask = (k_pos[None, :] > q_pos[:, None])[None, None, None, :, :]
+
+        if pad_mask is not None:
+            # Real queries must not see padding. Padding queries are left
+            # UNMASKED on purpose: blocking every key would leave a row of all
+            # -inf, whose softmax is NaN, and 0 * NaN in the value matmul would
+            # then poison the real positions too.
+            pad_k = pad_mask[:, None, None, None, :]                       # (b,1,1,1,Tk)
+            pad_q = pad_mask[:, start_pos:start_pos + num_tokens]           # (b,Tq)
+            mask = mask | (pad_k & ~pad_q[:, None, None, :, None])
+
         attn_scores = attn_scores.masked_fill(mask, -torch.inf)
         attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
-        context = (attn_weights @ values).transpose(1, 2)
-        context = context.reshape(b, num_tokens, self.d_out)
+        context = attn_weights @ values.unsqueeze(2)            # (b, g, gs, Tq, hd)
+        context = context.reshape(b, self.num_heads, num_tokens, self.head_dim)
+        context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
     
 
@@ -205,10 +300,11 @@ class Block(nn.Module):
         self.norm1 = RMSNorm(cfg.emb_dim, eps=1e-6)
         self.norm2 = RMSNorm(cfg.emb_dim, eps=1e-6)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, layer_idx=0, start_pos=0, pad_mask=None):
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x, cos, sin)
+        x = self.att(x, cos, sin, cache=cache, layer_idx=layer_idx,
+                     start_pos=start_pos, pad_mask=pad_mask)
         x = x + shortcut
 
         shortcut = x
@@ -242,15 +338,30 @@ class Qwen3Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.dtype = cfg.dtype
 
-    def forward(self, in_idx):
+    def forward(self, in_idx, cache=None, start_pos=0, pad_mask=None,
+                logits_last_only=False):
+        """cache/start_pos/pad_mask/logits_last_only are inference-only.
+
+        Training calls model(in_idx) and gets the identical full-sequence
+        forward it always did.
+
+        logits_last_only: project only the final position through out_head.
+            Greedy decoding reads logits[:, -1] and throws the rest away, but
+            out_head is 5120 x 151936 -- at batch 128 with a 217-token prompt the
+            discarded part is an 8.4 GB allocation, which is what caps the
+            evaluation batch size.
+        """
         x = self.tok_emb(in_idx)
 
-        for block in self.transformer_blocks:
-            x = block(x, self.cos, self.sin)
+        for layer_idx, block in enumerate(self.transformer_blocks):
+            x = block(x, self.cos, self.sin, cache=cache, layer_idx=layer_idx,
+                      start_pos=start_pos, pad_mask=pad_mask)
 
         x = self.final_norm(x)
+        if logits_last_only:
+            x = x[:, -1:, :]
         logits = self.out_head(x.to(self.dtype))
-        
+
         return logits
 
 
@@ -533,48 +644,48 @@ class QWEN_32B_CFG:
     dtype: torch.dtype = torch.bfloat16 # Lower-precision dtype to reduce memory usage
 
 
-if __name__ == '__main__':
-    from qwen_tokenizer import Qwen3Tokenizer
+# if __name__ == '__main__':
+#     from qwen_tokenizer import Qwen3Tokenizer
 
-    TOKENIZER_PATH = "collections/qwen3/models/tokenizer.json"
+#     TOKENIZER_PATH = "collections/qwen3/models/tokenizer.json"
 
-    # Qwen3 - 0.6B 
-    model = Qwen3Model(QWEN_06B_CFG)
-    model = from_pretrained(model, repo_id="Qwen/Qwen3-0.6B-Base") #Pretraining
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-0.6B") #SFT/RLHF 
+#     # Qwen3 - 0.6B 
+#     model = Qwen3Model(QWEN_06B_CFG)
+#     model = from_pretrained(model, repo_id="Qwen/Qwen3-0.6B-Base") #Pretraining
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-0.6B") #SFT/RLHF 
 
-    # Qwen3 - 1.7B 
-    # model = Qwen3Model(QWEN_1B7_CFG)
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-1.7B-Base") #Pretraining
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-1.7B") #SFT/RLHF 
+#     # Qwen3 - 1.7B 
+#     # model = Qwen3Model(QWEN_1B7_CFG)
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-1.7B-Base") #Pretraining
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-1.7B") #SFT/RLHF 
     
-    # Qwen3 - 4B
-    # model = Qwen3Model(QWEN_4B_CFG)
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-4B-Base") #Pretraining
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-4B") #SFT/RLHF 
+#     # Qwen3 - 4B
+#     # model = Qwen3Model(QWEN_4B_CFG)
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-4B-Base") #Pretraining
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-4B") #SFT/RLHF 
 
-    # Qwen3 - 8B
-    # model = Qwen3Model(QWEN_8B_CFG)
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-8B-Base") #Pretraining 
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-8B") #SFT/RLHF 
+#     # Qwen3 - 8B
+#     # model = Qwen3Model(QWEN_8B_CFG)
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-8B-Base") #Pretraining 
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-8B") #SFT/RLHF 
 
-    # Qwen3 - 14B
-    # model = Qwen3Model(QWEN_14B_CFG)
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-14B-Base") #Pretraining
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-14B") #SFT/RLHF 
+#     # Qwen3 - 14B
+#     # model = Qwen3Model(QWEN_14B_CFG)
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-14B-Base") #Pretraining
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-14B") #SFT/RLHF 
 
-    # Qwen3 - 32B
-    # model = Qwen3Model(QWEN_32B_CFG)
-    # model = from_pretrained(model, repo_id="Qwen/Qwen3-32B") #SFT/RLHF 
+#     # Qwen3 - 32B
+#     # model = Qwen3Model(QWEN_32B_CFG)
+#     # model = from_pretrained(model, repo_id="Qwen/Qwen3-32B") #SFT/RLHF 
 
 
-    # 2. Load tokenizer (same for all Qwen3 model sizes)
-    tokenizer = Qwen3Tokenizer(TOKENIZER_PATH)
-    model.cuda()
+#     # 2. Load tokenizer (same for all Qwen3 model sizes)
+#     tokenizer = Qwen3Tokenizer(TOKENIZER_PATH)
+#     model.cuda()
 
-    # 3. Demo 
-    prompt = "Explain large language models in a single sentence."
-    output = generate(
-        model, tokenizer, prompt, 
-        max_length=200, temperature=0.0, top_k=0.0
-    )
+#     # 3. Demo 
+#     prompt = "Explain large language models in a single sentence."
+#     output = generate(
+#         model, tokenizer, prompt, 
+#         max_length=200, temperature=0.0, top_k=0.0
+#     )

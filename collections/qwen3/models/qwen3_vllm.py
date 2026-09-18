@@ -86,7 +86,7 @@ class PagedAttention(nn.Module):
             rope_parameters={
                 "rope_type": "default",
                 "factor": 1.0,
-                "base": cfg.rope_base,
+                "rope_theta": cfg.rope_base,
             },
         )
 
