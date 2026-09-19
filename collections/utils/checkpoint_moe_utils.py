@@ -195,6 +195,24 @@ class MoELoRAMergeCheckpoint(_PL_CALLBACK_BASE):
         self._saved = []  # list of (score, path)
 
     def on_validation_end(self, trainer, pl_module):
+        """Export the merged model; never take the training run down with it.
+
+        This runs mid-training, and Lightning invokes plain Callbacks before
+        ModelCheckpoint, so an exception here also pre-empts the ordinary .ckpt
+        write and the run dies having saved nothing. A 60 GB merge-and-shard has
+        plenty of ways to fail late (disk, a renamed metric in the filename
+        template, a layout change in the expert tensors); none of them are worth
+        the hours of training already done. The failure is printed in full and
+        training continues to the next validation, which gets another attempt.
+        """
+        try:
+            self._save(trainer, pl_module)
+        except Exception as e:
+            import traceback
+            print(f"[merge-ckpt] export FAILED: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+    def _save(self, trainer, pl_module):
         metrics = trainer.callback_metrics
         current = metrics.get(self.monitor)
         if current is None:
@@ -325,6 +343,24 @@ class NemotronLoRAMergeCheckpoint(_PL_CALLBACK_BASE):
         self._saved = []
 
     def on_validation_end(self, trainer, pl_module):
+        """Export the merged model; never take the training run down with it.
+
+        This runs mid-training, and Lightning invokes plain Callbacks before
+        ModelCheckpoint, so an exception here also pre-empts the ordinary .ckpt
+        write and the run dies having saved nothing. A 60 GB merge-and-shard has
+        plenty of ways to fail late (disk, a renamed metric in the filename
+        template, a layout change in the expert tensors); none of them are worth
+        the hours of training already done. The failure is printed in full and
+        training continues to the next validation, which gets another attempt.
+        """
+        try:
+            self._save(trainer, pl_module)
+        except Exception as e:
+            import traceback
+            print(f"[merge-ckpt] export FAILED: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+    def _save(self, trainer, pl_module):
         metrics = trainer.callback_metrics
         current = metrics.get(self.monitor)
         if current is None:

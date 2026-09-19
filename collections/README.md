@@ -2,7 +2,7 @@
 
 # LLM Collections
 
-### Every SOTA LLM, rebuilt from scratch in pure PyTorch — and proven correct.
+### Every SOTA LLM, rebuilt from scratch in pure PyTorch
 
 *No `transformers`. No `peft`. No `trl`. Just tensors you can read, line by line.*
 
@@ -13,12 +13,21 @@
 
 </div>
 
+## ✨ Overview
+
+**Collections** This is the workflow for each folder model in here. This will have enough these step
+
+```
+Implement            Verify              Train                      Post-Train           Evaluate
+Scratch backbone ─►  HF safetensors ──►  SFT w/LoRA-QLoRA...  ───►  RLVR w/GRPO-DPO ───► Compare w/HF-Pretrained
+```
+
 ---
 
 ## 🎉 Latest Updates
 
 - 2026/09:
-  - **Chain-of-thought SFT for GSM8K** — [`2_Qwen3_Gsm8k_FineTune.py`](qwen3/2_Qwen3_Gsm8k_FineTune.py) now trains on the full `<think>…</think>` reasoning trace instead of the bare `\boxed{}` answer. Flip `INCLUDE_THINKING` to switch between the two recipes.
+  - **Chain-of-thought SFT for GSM8K** — [`1_Qwen3_Gsm8k_SFT.py`](qwen3/1_Qwen3_Gsm8k_SFT.py) now trains on the full `<think>…</think>` reasoning trace instead of the bare `\boxed{}` answer. Flip `INCLUDE_THINKING` to switch between the two recipes.
   - **Reworked training metrics** — token-weighted validation accuracy, cumulative supervised-token counts, grad-norm and VRAM per optimizer step, plus a full test-set evaluation every 20% of training.
 
 - 2026/05:
@@ -30,14 +39,3 @@
 
 ---
 
-## ✨ Overview
-
-**Collections** This is the workflow for each folder model in here. This will have enough these step
-
-```
-Implement            Verify              Train                      Post-Train           Evaluate
-scratch backbone ─►  HF safetensors ──►  SFT w/LoRA-QLoRA...  ───►  RLVR w/GRPO-DPO ───► Compare w/original pretrained
-```
-
-
----

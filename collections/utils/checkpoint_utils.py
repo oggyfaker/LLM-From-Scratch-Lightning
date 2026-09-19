@@ -68,8 +68,10 @@ class LoRAMergeCheckpoint(pl.Callback):
     directly into a vanilla Qwen3Model.
     """
 
-    def __init__(self, monitor='Validation/accuracy', mode='max', save_top_k=3,
-                 filename_template='{epoch:02d}-{Validation/loss:.4f}-{Validation/accuracy:.4f}'):
+    def __init__(self, monitor='Validation/box_answer_match_accuracy', mode='max',
+                 save_top_k=3,
+                 filename_template='{epoch:02d}-{Validation/loss:.4f}'
+                                   '-{Validation/box_answer_match_accuracy:.2f}'):
         super().__init__()
         self.monitor = monitor
         self.mode = mode
@@ -135,16 +137,28 @@ class LoRAMergeCheckpoint(pl.Callback):
 # -----
 
 def plot_training_curves(logger):
-    """Plot training loss, validation loss, and validation token accuracy from CSV logger.
+    """Plot training/validation loss and both accuracy metrics from the CSV logger.
+
+    Two different things are called "accuracy" in this run and they are not
+    comparable, so they get their own axes:
+      - Validation/token_accuracy — teacher-forced next-token accuracy (0-1)
+      - Validation/box_answer_match_accuracy — free-running solve rate (0-100%)
 
     Saves the figure to ``<log_dir>/loss_curve.png``.
     """
     metrics_path = os.path.join(logger.log_dir, "metrics.csv")
     metrics = pd.read_csv(metrics_path)
 
-    train_df_plot = metrics[["step", "Training/train_loss"]].dropna().reset_index(drop=True)
-    val_df_plot = metrics[["step", "Validation/loss"]].dropna().reset_index(drop=True)
-    val_acc_df = metrics[["step", "Validation/accuracy"]].dropna().reset_index(drop=True)
+    def series(column):
+        """step/value pairs for a metric, empty if the run never logged it."""
+        if column not in metrics.columns:
+            return pd.DataFrame(columns=["step", column])
+        return metrics[["step", column]].dropna().reset_index(drop=True)
+
+    train_df_plot = series("Training/train_loss")
+    val_df_plot = series("Validation/loss")
+    val_acc_df = series("Validation/token_accuracy")
+    box_acc_df = series("Validation/box_answer_match_accuracy")
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
 
     # Loss
@@ -158,16 +172,32 @@ def plot_training_curves(logger):
     ax1.legend()
     ax1.grid(True)
 
-    # Val Mean Token Accuracy
+    # Accuracies — teacher-forced token accuracy on the left axis, the
+    # boxed-answer solve rate on a twin axis since it runs on a 0-100 scale.
     if not val_acc_df.empty:
-        ax2.plot(val_acc_df["step"], val_acc_df["Validation/accuracy"],
-                marker="s", markersize=5, linewidth=1.5, label="Val Token Acc")
+        ax2.plot(val_acc_df["step"], val_acc_df["Validation/token_accuracy"],
+                marker="s", markersize=5, linewidth=1.5, color="tab:blue",
+                label="Val Token Acc (teacher-forced)")
     ax2.set_xlabel("Step")
-    ax2.set_ylabel("Accuracy")
-    ax2.set_title("Val Mean Token Accuracy")
+    ax2.set_ylabel("Token Accuracy")
     ax2.set_ylim(0, 1)
-    ax2.legend()
     ax2.grid(True)
+
+    lines, labels = ax2.get_legend_handles_labels()
+    if not box_acc_df.empty:
+        ax2b = ax2.twinx()
+        ax2b.plot(box_acc_df["step"],
+                  box_acc_df["Validation/box_answer_match_accuracy"],
+                  marker="o", markersize=6, linewidth=1.5, color="tab:red",
+                  label="Boxed-Answer Accuracy (solve rate)")
+        ax2b.set_ylabel("Boxed-Answer Accuracy (%)")
+        ax2b.set_ylim(0, 100)
+        b_lines, b_labels = ax2b.get_legend_handles_labels()
+        lines += b_lines
+        labels += b_labels
+
+    ax2.set_title("Validation Accuracy — token vs solve rate")
+    ax2.legend(lines, labels, loc="lower right")
 
     fig.tight_layout()
     save_path = os.path.join(logger.log_dir, "loss_curve.png")

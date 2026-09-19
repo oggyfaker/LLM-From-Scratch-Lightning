@@ -1,117 +1,137 @@
-import csv
+import json
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
+
+
+# Empty on purpose: Nemotron prompts carry their own "put your final answer
+# inside \boxed{}" instruction and the traces were generated against an empty
+# system turn. A system prompt here would move every sample off distribution.
+BASE_PROMPT = ""
 
 
 # --------------------
 # PROMPT CHAT TEMPLATE
 # --------------------
-def format_chat_prompt(user_content: str, thinking: str, final_answer: str) -> str:
-    """Apply Qwen3 chat template to a clean record.
+def format_chat_prompt(question: str, answer: str, thinking: str = None,
+                       base_prompt: str = BASE_PROMPT) -> str:
+    """Format a single sample into Qwen3 chat template string.
 
-    Reconstructs the EXACT original format from nemotron_decoded.csv:
-        <|im_start|>system
+    Direct mode (thinking=None):
+        <|im_start|>
+        system: {base_prompt}
         <|im_end|>
-        <|im_start|>user
-        {user_content}<|im_end|>
-        <|im_start|>assistant
-        <think>
-        {thinking}
-        </think>
-        \\boxed{final_answer}<|im_end|>
 
-    Args:
-        user_content: Clean user question
-        thinking: Full reasoning chain (already includes answer tail from CSV)
-        final_answer: Just the answer (without \\boxed{} wrapper — will be added)
+        <|im_start|>
+        user: {question}
+        <|im_end|>
 
-    Returns:
-        Full text with chat template applied (prompt + ground_truth combined).
+        <|im_start|>
+        assistant \\boxed{answer}
+        <|im_end|>
+
+    Thinking mode (thinking given):
+        <|im_start|>
+            system: {base_prompt}
+        <|im_end|>
+
+        <|im_start|>
+            user: {question}
+        <|im_end|>
+
+        <|im_start|>
+            assistant
+            <think> {thinking} </think>
+            \\boxed{answer}
+        <|im_end|>
     """
     return (
-        f"<|im_start|>system\n<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        f"<|im_start|>assistant\n<think>\n"
-        f"{thinking}\n</think>\n\\boxed{{{final_answer}}}<|im_end|>"
+        format_prompt_only(question, include_thinking=thinking is not None,
+                           base_prompt=base_prompt)
+        + (f"{thinking}\n</think>\n" if thinking is not None else "")
+        + f"\\boxed{{{answer}}}<|im_end|>"
     )
 
 
-def format_prompt_only(user_content: str) -> str:
-    """Build the prompt portion only (for inference / generation).
+def format_prompt_only(question: str, include_thinking: bool = False,
+                       base_prompt: str = BASE_PROMPT) -> str:
+    """Build the prompt portion only (for inference / loss masking).
 
-    Returns:
-        The input prompt that ends with <think>\\n (model generates from here).
+    Direct mode ends right after the assistant header, so the model generates
+    \\boxed{...} straight away.
+    Thinking mode ends at <think>\\n, so the model generates the reasoning first.
     """
-    return (
-        f"<|im_start|>system\n<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        f"<|im_start|>assistant\n<think>\n"
+    head = (
+        f"<|im_start|>system\n{base_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
+    return head + ("<think>\n" if include_thinking else "")
 
 
 # -------------------
 # LOAD CLEAN DATASET
 # -------------------
-def load_nemotron_csv(csv_path: str) -> list:
-    """Load nemotron_decoded_clean.csv (already cleaned by clean_csv.py).
-
-    Expected columns: problem_id, user_content, thinking, final_answer,
-                      num_tokens, num_prompt_tokens, num_gt_tokens
+def load_nemotron_json(json_path: str) -> list:
+    """Load train.json / test.json.
 
     Each record is a dict with:
-        - problem_id: str
-        - user_content: str (clean question)
-        - thinking: str (reasoning chain)
-        - final_answer: str (e.g. \\\\boxed{...})
-        - num_tokens: int
+        - problem_id: str (stable id from the source dataset)
+        - category: str (one of 9 task families, e.g. bit_manipulation, cipher)
+        - question: str (problem statement)
+        - thinking: str (reasoning chain, <think> tags stripped)
+        - answer: str (final answer, \\boxed{} wrapper stripped)
+        - num_gt_tokens: int (assistant ground-truth length, thinking + answer)
+
+    The last four fields match data/Gsm8k/train.json, so both datasets drive the
+    same Dataset / collate / grading code.
     """
-    records = []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            records.append({
-                "problem_id": row["problem_id"],
-                "user_content": row["user_content"],
-                "thinking": row["thinking"],
-                "final_answer": row["final_answer"],
-                "num_tokens": int(row["num_tokens"]),
-            })
-    return records
+    with open(json_path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    return [
+        {
+            "problem_id": rec["problem_id"],
+            "category": rec["category"],
+            "question": rec["question"],
+            "thinking": rec["thinking"],
+            "answer": rec["answer"],
+            "num_gt_tokens": int(rec["num_gt_tokens"]),
+        }
+        for rec in records
+    ]
 
 
 # -----------------
 # TORCH DATASET
 # -----------------
 class NemotronReasoningDataset(Dataset):
-    def __init__(self, records, tokenizer, max_seq_len=None):
+    def __init__(self, records, tokenizer, max_seq_len=None, include_thinking=True):
         """Pre-tokenize all samples into token ID lists.
 
-        Stores prompt_length (system + user tokens) so the collate function
-        can mask prompt positions in targets -> loss only on assistant response.
+        Stores prompt_length (system + user + assistant header) so the collate
+        function can mask prompt positions in targets -> loss only on the answer.
 
         Args:
-            records: list of dicts from load_nemotron_csv
-            tokenizer: Qwen3Tokenizer instance
+            records: list of dicts from load_nemotron_json
+            tokenizer: Qwen3Tokenizer or a HuggingFace Qwen3 tokenizer
             max_seq_len: optional max sequence length filter (skip longer samples)
+            include_thinking: train on the reasoning chain before the answer
         """
         self.encoded_texts = []
         self.prompt_lengths = []
         self.records = []
 
         for rec in records:
-            # Build prompt-only text (system + user + assistant start)
-            prompt_text = format_prompt_only(rec["user_content"])
+            thinking = rec["thinking"] if include_thinking else None
 
-            # Build full text (prompt + response) with chat template applied
+            prompt_text = format_prompt_only(
+                rec["question"], include_thinking=include_thinking
+            )
             full_text = format_chat_prompt(
-                rec["user_content"],
-                rec["thinking"],
-                rec["final_answer"],
+                rec["question"], rec["answer"], thinking=thinking
             )
 
             full_ids = tokenizer.encode(full_text)
 
-            # Skip if exceeds max_seq_len
             if max_seq_len is not None and len(full_ids) > max_seq_len:
                 continue
 
@@ -202,91 +222,40 @@ if __name__ == "__main__":
     Qwen3Tokenizer = _mod.Qwen3Tokenizer
 
     # --- Config ---
-    CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron_decoded_clean.csv")
+    HERE = os.path.dirname(os.path.abspath(__file__))
     TOKENIZER_PATH = os.path.join(project_root, "collections", "qwen3", "models", "tokenizer.json")
-    BATCH_SIZE = 2
-    MAX_SEQ_LEN = 4096  # Filter out very long sequences for testing
+    MAX_SEQ_LEN = 8192
     NUM_SAMPLES_TO_SHOW = 2
 
-    print(f"Loading tokenizer from: {TOKENIZER_PATH}")
     tokenizer = Qwen3Tokenizer(tokenizer_file_path=TOKENIZER_PATH)
 
-    print(f"Loading clean dataset from: {CSV_PATH}")
-    records = load_nemotron_csv(CSV_PATH)
-    print(f"Total records loaded: {len(records)}")
+    for split in ("train", "test"):
+        json_path = os.path.join(HERE, f"{split}.json")
+        records = load_nemotron_json(json_path)
+        print(f"\n{'=' * 70}\n{split}.json — records loaded: {len(records)}\n{'=' * 70}")
 
-    # Show a sample with chat template applied
-    print("\n" + "=" * 80)
-    print("SAMPLE DATA (Record 0) - Chat template applied")
-    print("=" * 80)
-    rec = records[0]
-    print(f"Problem ID: {rec['problem_id']}")
-    print(f"\nUser Content (first 300 chars):\n{rec['user_content'][:300]}")
-    print(f"\nThinking (first 300 chars):\n{rec['thinking'][:300]}")
-    print(f"\nFinal Answer:\n{rec['final_answer']}")
-    print(f"\n--- format_chat_prompt output (first 400 chars) ---")
-    full = format_chat_prompt(rec["user_content"], rec["thinking"], rec["final_answer"])
-    print(full[:400])
-    print(f"\n--- format_prompt_only output ---")
-    print(format_prompt_only(rec["user_content"])[:300])
+        dataset = NemotronReasoningDataset(
+            records, tokenizer, max_seq_len=MAX_SEQ_LEN, include_thinking=True
+        )
+        lengths = [len(ids) for ids in dataset.encoded_texts]
+        print(f"[thinking] samples: {len(dataset)} (dropped "
+              f"{len(records) - len(dataset)} over {MAX_SEQ_LEN} tok) | "
+              f"max seq len: {max(lengths)}")
 
-    # Build dataset
-    print("\n" + "=" * 80)
-    print(f"Building NemotronReasoningDataset (max_seq_len={MAX_SEQ_LEN})...")
-    print("=" * 80)
-    dataset = NemotronReasoningDataset(records, tokenizer, max_seq_len=MAX_SEQ_LEN)
-    print(f"Dataset size (after filtering): {len(dataset)}")
+        for i in range(min(NUM_SAMPLES_TO_SHOW, len(dataset))):
+            full_ids, prompt_len = dataset[i]
+            rec = dataset.records[i]
+            print(f"  sample {i}: [{rec['category']}] {len(full_ids)} tok, "
+                  f"prompt {prompt_len} tok, "
+                  f"supervised {len(full_ids) - prompt_len + 1} tok, "
+                  f"answer {rec['answer']!r}")
+            tail = tokenizer.decode(full_ids[-60:])
+            print(f"    supervised tail: {tail!r}")
 
-    # Create DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=lambda batch: custom_collate_fn(
-            batch,
-            pad_token_id=tokenizer.pad_token_id,
-            allowed_max_length=MAX_SEQ_LEN,
-        ),
-    )
-
-    # Iterate and decode
-    print("\n" + "=" * 80)
-    print(f"DataLoader: {len(dataloader)} batches (batch_size={BATCH_SIZE})")
-    print("=" * 80)
-
-    for batch_idx, (inputs, targets) in enumerate(dataloader):
-        if batch_idx >= NUM_SAMPLES_TO_SHOW:
-            break
-
-        print(f"\n{'─' * 60}")
-        print(f"Batch {batch_idx}: inputs.shape={inputs.shape}, targets.shape={targets.shape}")
-        print(f"{'─' * 60}")
-
-        for sample_idx in range(inputs.shape[0]):
-            input_ids = inputs[sample_idx]
-            target_ids = targets[sample_idx]
-
-            # Decode input tokens
-            # Remove padding for cleaner display
-            non_pad_mask = input_ids != tokenizer.pad_token_id
-            input_ids_clean = input_ids[non_pad_mask].tolist()
-
-            # Decode target tokens (remove ignore_index and padding)
-            valid_target_mask = (target_ids != -100) & (target_ids != tokenizer.pad_token_id)
-            target_ids_clean = target_ids[valid_target_mask].tolist()
-
-            decoded_input = tokenizer.decode(input_ids_clean)
-            decoded_target = tokenizer.decode(target_ids_clean)
-
-            print(f"\n  [Sample {sample_idx}]")
-            print(f"  Input token count (non-pad): {len(input_ids_clean)}")
-            print(f"  Target token count (valid): {len(target_ids_clean)}")
-            print(f"\n  --- DECODED INPUT (first 500 chars) ---")
-            print(f"  {decoded_input[:500]}")
-            print(f"\n  --- DECODED TARGET / GROUND TRUTH (first 500 chars) ---")
-            print(f"  {decoded_target[:500]}")
-            print()
-
-    print("\n" + "=" * 80)
-    print("DONE - Dataset test complete.")
-    print("=" * 80)
+        batch = [dataset[i] for i in range(min(2, len(dataset)))]
+        inputs, targets = custom_collate_fn(
+            batch, pad_token_id=tokenizer.eos_token_id, allowed_max_length=MAX_SEQ_LEN
+        )
+        supervised = (targets != -100).sum().item()
+        print(f"  batch inputs {tuple(inputs.shape)} targets {tuple(targets.shape)} "
+              f"| supervised positions: {supervised}")

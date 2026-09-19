@@ -79,7 +79,14 @@ ENV/
 
 # ---------------------------------------------------------------------------
 # Tooling caches
+#
+# unsloth_compiled_cache/ is generated source that Unsloth writes on import.
+# Its location comes from UNSLOTH_COMPILE_LOCATION, which defaults to a RELATIVE
+# path and so lands in whatever directory the process was launched from. The
+# training scripts pin it to their own folder, but the bare pattern is listed
+# here too so a stray copy from another cwd never gets committed.
 # ---------------------------------------------------------------------------
+unsloth_compiled_cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

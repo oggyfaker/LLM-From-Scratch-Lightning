@@ -40,9 +40,9 @@ LLM_From_Scratch_Lightning/
 ├── 1_Qwen3_SFT_LoRA_4bit_Inference.ipynb  # Inference notebook (vLLM)
 ├── collections/
 │   ├── qwen3/
-│   │   ├── 0_Qwen3_Jigsaw_Classify_Finetune.py     # Dense, Jigsaw rule classification
-│   │   ├── 1_Qwen3_MoE_Nemotron_Reasoning_FineTune.py  # MoE, Nemotron reasoning (Unsloth)
-│   │   ├── 2_Qwen3_Gsm8k_FineTune.py      # Dense 14B, GSM8K direct answer
+│   │   ├── 1_Qwen3_Gsm8k_SFT.py           # Dense 14B from-scratch, GSM8K chain-of-thought
+│   │   ├── 2_Qwen3_MoE_Gsm8k_SFT.py       # MoE 30B-A3B (Unsloth), GSM8K chain-of-thought
+│   │   ├── 3_Qwen3_MoE_Nemotron_SFT.py    # MoE 30B-A3B (Unsloth), Nemotron reasoning
 │   │   └── models/
 │   │       ├── qwen3_dense.py             # From-scratch Qwen3 dense model
 │   │       ├── qwen3_vllm.py              # vLLM-compatible dense wrapper
@@ -52,16 +52,12 @@ LLM_From_Scratch_Lightning/
 │       ├── checkpoint_utils.py            # LoRA merge, safetensor export, plotting
 │       ├── checkpoint_moe_utils.py        # MoE LoRA merge (3D experts → HF format)
 │       └── verify_checkpoint.py           # Merged-checkpoint diagnostic
-├── data/
-│   ├── Jigsaw2026/
-│   │   ├── data_utils.py                  # Dataset, collate, prompt formatting
-│   │   ├── train.csv
-│   │   └── test.csv
+├── data/                                  # Both datasets share one record schema:
+│   │                                      # question / thinking / answer / num_gt_tokens
 │   ├── NemotronReasoning2026/
-│   │   ├── data_utils.py                  # Reasoning dataset, chat formatting
-│   │   ├── clean_csv.py                   # CSV cleaning
-│   │   ├── merge_clean_datasets.py        # Dataset merge
-│   │   └── nemotron_decoded_clean.csv
+│   │   ├── data_utils.py                  # Reasoning dataset, \boxed{} chat formatting
+│   │   ├── train.json                     # 7426 records
+│   │   └── test.json                      # 404 records (held out by question)
 │   └── Gsm8k/
 │       ├── data_utils.py                  # GSM8K dataset, \boxed{} chat formatting
 │       ├── download_gsm8k.py              # Fetch from HF → train.json / test.json
@@ -167,15 +163,15 @@ The training script downloads Qwen3 pretrained weights automatically on first ru
 conda activate LLM
 cd LLM_From_Scratch_Lightning
 
-# Dense (from-scratch Qwen3, LoRA / QLoRA)
-python collections/qwen3/0_Qwen3_Jigsaw_Classify_Finetune.py
-
-# MoE 30B-A3B (Unsloth backbone, LoRA / QLoRA)
-python collections/qwen3/1_Qwen3_MoE_Nemotron_Reasoning_FineTune.py
-
-# GSM8K math, direct answer (Qwen3-14B)
+# GSM8K math, chain-of-thought (from-scratch Qwen3-14B)
 python data/Gsm8k/download_gsm8k.py     # once, builds train.json / test.json
-python collections/qwen3/2_Qwen3_Gsm8k_FineTune.py
+python collections/qwen3/1_Qwen3_Gsm8k_SFT.py
+
+# GSM8K math, MoE 30B-A3B (Unsloth backbone, LoRA / QLoRA)
+python collections/qwen3/2_Qwen3_MoE_Gsm8k_SFT.py
+
+# Nemotron reasoning, MoE 30B-A3B (train.json / test.json are committed)
+python collections/qwen3/3_Qwen3_MoE_Nemotron_SFT.py
 ```
 
 ### Inference
