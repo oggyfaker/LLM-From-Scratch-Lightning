@@ -27,12 +27,9 @@ Memory-Efficient MoE LoRA:
     Intermediates are only [tokens, rank=16] — negligible memory.
 """
 import gc
-import re
 import sys
-import json
 import math
 import time
-import random
 from pathlib import Path
 from functools import partial
 from dataclasses import dataclass
@@ -62,11 +59,15 @@ sys.path.append(str(COLLECTIONS_DIR))
 sys.path.append(str(MODELS_DIR))
 
 from data.NemotronReasoning2026.data_utils import (
-    load_nemotron_json, NemotronReasoningDataset, custom_collate_fn,
-    format_prompt_only
+    load_nemotron_json, NemotronReasoningDataset, custom_collate_fn
 )
+# Grading + the periodic generative eval live with the dataset. The round
+# machinery is shared with GSM8K; only Nemotron's string-first matching,
+# stratified sampling and per-category reporting are overridden there.
+from data.NemotronReasoning2026.metric import NemotronEvalCallback, ACCURACY_KEY
 from utils.checkpoint_utils import plot_training_curves
 from utils.checkpoint_moe_utils import MoELoRAMergeCheckpoint
+from utils.generation_utils import hf_generate_batch, UnslothEvalMixin
 
 
 # ──────────────
@@ -120,8 +121,13 @@ class CFG:
     INFER_BATCH_SIZE = 4
 
     # Full budget, so the model is never cut off before closing </think> and
-    # writing \boxed{}. _generate_batch clamps per batch to MAX_SEQ_LEN - prompt.
+    # writing \boxed{}. hf_generate_batch clamps per batch to MAX_SEQ_LEN - prompt.
     INFER_MAX_NEW_TOKENS = MAX_SEQ_LEN if INCLUDE_THINKING else 64
+
+    # Turn-enders BEYOND the tokenizer's own eos_token_id, which the eval
+    # callback picks up on its own. Qwen3's chat format ends an assistant turn
+    # with <|im_end|> but also honours <|endoftext|>.
+    INFER_STOP_TOKENS = ("<|endoftext|>", "<|im_end|>")
 
     # ── Model ──
     MODEL_PATH = "Qwen/Qwen3-30B-A3B"
@@ -788,542 +794,24 @@ def lightning_ai_ready():
     return False
 
 
-# -----------------------------------
-# ANSWER GRADING  (Correct/Wrong/Bad)
-# -----------------------------------
-# Same three-label scheme as 1_Qwen3_Gsm8k_SFT.py, but matching is STRING-first,
-# not numeric. Nemotron answers are 8-bit strings ("00110100"), cipher phrases,
-# Roman numerals and punctuation runs — float() would score a model that dropped
-# two leading zeros as Correct. Numeric is only a fallback, and only where it
-# cannot hide a formatting error.
+# ───────────────────────────────────────────────
+#  GENERATIVE EVALUATION (NEMOTRON, HF BACKBONE)
+# ───────────────────────────────────────────────
 
-THINK_CLOSE = "</think>"
+class NemotronMoEEvalCallback(UnslothEvalMixin, NemotronEvalCallback):
+    """Nemotron's eval, driven through HuggingFace generate().
 
-BOXED_OPEN = "\\boxed{"
+    Grading, stratified sampling, per-category reporting and the round
+    machinery are all inherited. The only additions are the backbone's, from
+    utils/generation_utils.py:
 
-# A leading zero before another digit makes the string form significant, so
-# numeric comparison is refused for it.
-LEADING_ZERO_RE = re.compile(r"^[+-]?0\d")
+        UnslothEvalMixin   swaps flex_attention out for eager and flips Unsloth
+                           between for_training() and for_inference()
+        hf_generate_batch  passed as generate_fn below, since an HF model has
+                           no generate_batch of its own
 
-
-def extract_boxed(text):
-    """Return every \\boxed{...} payload in `text`, outermost braces balanced.
-
-    GSM8K's regex stops at the first closing brace, returning "\\text{XLIV" for
-    \\boxed{\\text{XLIV}}, which Nemotron models emit often enough to matter.
+    Nothing dataset-specific is overridden, so this class stays empty on purpose.
     """
-    results = []
-    idx = text.find(BOXED_OPEN)
-    while idx != -1:
-        start = idx + len(BOXED_OPEN)
-        depth, pos = 1, start
-        while pos < len(text) and depth > 0:
-            if text[pos] == "{":
-                depth += 1
-            elif text[pos] == "}":
-                depth -= 1
-            pos += 1
-        if depth == 0:                      # a closing brace was actually found
-            results.append(text[start:pos - 1])
-        idx = text.find(BOXED_OPEN, start)
-    return results
-
-
-def normalize_answer(text):
-    """Strip LaTeX wrappers, collapse whitespace, drop a trailing period.
-
-    Case is preserved; answers_match decides whether case matters.
-    """
-    s = (text or "").strip()
-    for wrapper in ("\\text", "\\mathrm", "\\mathbf"):
-        if s.startswith(wrapper + "{") and s.endswith("}"):
-            s = s[len(wrapper) + 1:-1].strip()
-    if len(s) >= 2 and s.startswith("$") and s.endswith("$"):
-        s = s[1:-1].strip()
-    s = s.replace("\\", "").strip()
-    s = " ".join(s.split())
-    return s.rstrip(".").strip()
-
-
-def to_number(text):
-    """Return the numeric value of an answer string, or None if it isn't one."""
-    try:
-        return float(normalize_answer(text).replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-
-
-def answers_match(prediction, expected):
-    """True when `prediction` is the same answer as `expected`.
-
-      1. Case-insensitive string equality after normalization — decides
-         bit_manipulation, cipher, numeral and cryptarithm.
-      2. Numeric equality as a fallback, only when neither side has a
-         significant leading zero, so "110100" vs "00110100" stays Wrong.
-    """
-    pred_norm = normalize_answer(prediction)
-    gold_norm = normalize_answer(expected)
-    if pred_norm.casefold() == gold_norm.casefold():
-        return True
-
-    if LEADING_ZERO_RE.match(pred_norm) or LEADING_ZERO_RE.match(gold_norm):
-        return False
-    pred_num, gold_num = to_number(prediction), to_number(expected)
-    return pred_num is not None and gold_num is not None and pred_num == gold_num
-
-
-def classify(completion, expected, thinking_mode, finish_reason):
-    """Grade one completion -> (matching, prediction, thinking_model, bad_reason).
-
-    ``matching`` is one of three labels:
-        Correct  a well-formed \boxed{...} whose value equals the ground truth
-        Wrong    a clean extracted answer, but not the right one
-        Bad      no usable answer could be extracted at all
-
-    ``bad_reason`` keeps a budget artefact from being read as a reasoning error:
-        empty_output        model returned nothing
-        think_not_closed    thinking mode, </think> never emitted
-        truncated_length    hit max_new_tokens with no answer
-        no_boxed_answer     finished cleanly but never wrote \boxed{...}
-        empty_box           wrote \boxed{} with nothing inside
-    """
-    text = completion or ""
-
-    # 1. Split the reasoning off. Only text AFTER </think> may carry the final
-    #    answer — scanning the chain of thought would credit a lucky intermediate.
-    #    Nemotron traces box the answer inside the reasoning too, so without
-    #    this split almost everything would grade Correct.
-    if thinking_mode:
-        if THINK_CLOSE in text:
-            thinking_model, _, answer_region = text.partition(THINK_CLOSE)
-            thinking_model, answer_region = thinking_model.strip(), answer_region.strip()
-        else:
-            return ("Bad", None, text.strip(),
-                    "empty_output" if not text.strip()
-                    else ("truncated_length" if finish_reason == "length"
-                          else "think_not_closed"))
-    else:
-        thinking_model, answer_region = "", text.strip()
-
-    if not text.strip():
-        return "Bad", None, thinking_model, "empty_output"
-
-    # 2. The LAST box wins: reasoning often boxes an intermediate result first.
-    matches = extract_boxed(answer_region)
-    if not matches:
-        reason = "truncated_length" if finish_reason == "length" else "no_boxed_answer"
-        return "Bad", None, thinking_model, reason
-
-    prediction = matches[-1].strip()
-    if not prediction:
-        return "Bad", None, thinking_model, "empty_box"
-
-    matching = "Correct" if answers_match(prediction, expected) else "Wrong"
-    return matching, prediction, thinking_model, None
-
-
-def build_record(rec, completion, finish_reason, thinking_mode):
-    """One graded row, in the schema the GSM8K run writes plus the category."""
-    matching, prediction, thinking_model, bad_reason = classify(
-        completion, rec["answer"], thinking_mode, finish_reason
-    )
-    return {
-        "problem_id": rec["problem_id"],
-        "category": rec["category"],
-        "question": rec["question"],
-        "thinking": rec["thinking"],
-        "answer": rec["answer"],
-        "num_gt_tokens": rec["num_gt_tokens"],
-        "prediction": prediction,
-        "thinking-model": thinking_model,
-        "matching": matching,
-        # --- diagnostics ---
-        "bad_reason": bad_reason,
-        "finish_reason": finish_reason,
-    }
-
-
-def summarize(version, rows, elapsed=None):
-    """Counts + boxed-answer accuracy for one round, broken down per category."""
-    n = len(rows)
-    counts = {k: sum(r["matching"] == k for r in rows)
-              for k in ("Correct", "Wrong", "Bad")}
-    bad_reasons = {}
-    for r in rows:
-        if r["bad_reason"]:
-            bad_reasons[r["bad_reason"]] = bad_reasons.get(r["bad_reason"], 0) + 1
-
-    per_category = {}
-    for r in rows:
-        bucket = per_category.setdefault(r["category"], {"n": 0, "correct": 0})
-        bucket["n"] += 1
-        bucket["correct"] += r["matching"] == "Correct"
-    for bucket in per_category.values():
-        bucket["accuracy"] = 100.0 * bucket["correct"] / max(1, bucket["n"])
-
-    return {"version": version, "questions": n, **counts,
-            "accuracy": 100.0 * counts["Correct"] / max(1, n),
-            "bad_reasons": bad_reasons, "per_category": per_category,
-            "elapsed_sec": elapsed}
-
-
-# --------------------------------------------
-# PERIODIC GENERATIVE EVALUATION (TEST SET)
-# --------------------------------------------
-
-class BoxedAnswerEvalCallback(pl.Callback):
-    """Solve held-out questions by generation, 5 times during training.
-
-    Fires every ``every_pct`` of the planned optimizer steps (0.20 -> 20/40/60/
-    80/100%), greedily decodes a stratified sample of the test set and grades it
-    with the classify() above.
-
-    Decoding goes through model.generate() rather than the from-scratch KVCache
-    1_ uses. This class owns what is not generic: swapping the attention
-    implementation, switching Unsloth out of training mode, batching by prompt
-    length, surviving OOM, and grading.
-
-    Runs from on_train_batch_end, which Lightning calls just BEFORE the
-    validation loop, so the metrics reach callback_metrics in time for the
-    checkpoint callbacks that monitor them on_validation_end.
-    """
-
-    # <|endoftext|> and <|im_end|> both end an assistant turn.
-    STOP_TOKENS = ("<|endoftext|>", "<|im_end|>")
-
-    def __init__(self, tokenizer, records, every_pct, max_new_tokens, total_steps,
-                 batch_size, output_dir, num_samples=None, seed=CFG.SEED):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        # Hard ceiling on prompt + generation, matching the training filter.
-        self.max_total_len = CFG.MAX_SEQ_LEN
-        self.batch_size = batch_size
-        # Where each round's graded answers land: logs/<run_name>/validation/
-        self.output_dir = Path(output_dir)
-        self.total_steps = max(1, total_steps)
-        self.every = max(1, int(round(self.total_steps * every_pct)))
-        self.thinking_mode = CFG.INCLUDE_THINKING
-
-        self.records = self._select(records, num_samples, seed)
-
-        ids = {tokenizer.convert_tokens_to_ids(t) for t in self.STOP_TOKENS}
-        self.eos_ids = sorted(i for i in ids if isinstance(i, int) and i >= 0)
-        if not self.eos_ids:
-            self.eos_ids = [tokenizer.eos_token_id]
-        self.pad_id = (tokenizer.pad_token_id
-                       if tokenizer.pad_token_id is not None
-                       else tokenizer.eos_token_id)
-
-        self._fired = set()
-        self._round_idx = 0
-        self._last_metrics = None   # last successful round, for _guarded_run
-        self._train_attn_impl = None  # restored after each round by _set_mode
-
-    @staticmethod
-    def _select(records, num_samples, seed):
-        """Stratified sample of the test set, or all of it when num_samples is None.
-
-        A uniform 32 of 404 would miss equation_numeric_guess (6 rows) entirely,
-        so rounds would move with the draw rather than the model. Sampling within
-        each category, at least one row each, keeps rounds comparable; the sample
-        is fixed for the whole run.
-        """
-        records = list(records)
-        if num_samples is None or num_samples >= len(records):
-            return records
-
-        by_category = {}
-        for rec in records:
-            by_category.setdefault(rec["category"], []).append(rec)
-
-        rng = random.Random(seed)
-        quota = num_samples / len(records)
-        chosen = []
-        for category in sorted(by_category):
-            bucket = by_category[category]
-            rng.shuffle(bucket)
-            chosen.extend(bucket[:max(1, round(len(bucket) * quota))])
-
-        # Rounding per category can overshoot or undershoot the target.
-        rng.shuffle(chosen)
-        if len(chosen) > num_samples:
-            return chosen[:num_samples]
-        if len(chosen) < num_samples:
-            picked = {id(r) for r in chosen}
-            spare = [r for r in records if id(r) not in picked]
-            rng.shuffle(spare)
-            chosen.extend(spare[:num_samples - len(chosen)])
-        return chosen
-
-    # ---------------------------------------------------------- scheduling
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        step = pl_module._opt_step
-        if step == 0 or step % self.every != 0 or step in self._fired:
-            return
-        self._fired.add(step)
-        self._guarded_run(trainer, pl_module, step)
-
-    def on_train_end(self, trainer, pl_module):
-        # Final round, unless a boundary already fired close to the end.
-        step = pl_module._opt_step
-        if step <= 0 or step in self._fired:
-            return
-        if self._fired and (step - max(self._fired)) < self.every // 2:
-            return
-        self._fired.add(step)
-        self._guarded_run(trainer, pl_module, step)
-
-    def _guarded_run(self, trainer, pl_module, step):
-        """Run a round; never let an eval bug destroy the training run.
-
-        Round 1 re-raises: if it cannot run, the checkpoint callbacks monitor a
-        metric that would never exist, and failing early is cheaper.
-        """
-        try:
-            self._run(trainer, pl_module, step)
-        except Exception as e:
-            import traceback
-            print(f"\n  [eval] round {self._round_idx} FAILED: "
-                  f"{type(e).__name__}: {e}", flush=True)
-            traceback.print_exc()
-            torch.cuda.empty_cache()
-            self._set_mode(pl_module.model, inference=False)
-            pl_module.model.train()
-
-            if self._last_metrics is None:
-                print("  [eval] first round failed — re-raising.", flush=True)
-                raise
-            # Re-publish the previous round so ModelCheckpoint still finds its
-            # monitored key and training carries on to the next boundary.
-            print("  [eval] carrying forward the previous round's metrics.", flush=True)
-            trainer.callback_metrics.update(
-                {k: torch.tensor(v) for k, v in self._last_metrics.items()})
-
-    # ---------------------------------------------------------- generation
-    @torch.no_grad()
-    def _generate_batch(self, model, prompts):
-        """Greedy-decode a batch of prompts -> ([(text, finish_reason), ...], steps, budget).
-
-        Prompts are LEFT-padded so every row's next-token slot is the last
-        column and the whole batch shares one position offset; HF applies the
-        attention mask so the pad prefix contributes nothing.
-        """
-        device = next(model.parameters()).device
-        # HF defaults to right padding, which would make the model continue
-        # from the pad block instead of the prompt.
-        previous_side = self.tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
-        try:
-            enc = self.tokenizer(prompts, return_tensors="pt", padding=True,
-                                 add_special_tokens=False)
-        finally:
-            self.tokenizer.padding_side = previous_side
-
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
-        prompt_len = input_ids.shape[1]
-
-        # Never generate past what training ever produced (see INFER_MAX_NEW_TOKENS).
-        max_new = max(1, min(self.max_new_tokens, self.max_total_len - prompt_len))
-
-        out = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new,
-            do_sample=False,          # greedy, so rounds differ only by the model
-            use_cache=True,
-            eos_token_id=self.eos_ids,
-            pad_token_id=self.pad_id,
-        )
-
-        generated = out[:, prompt_len:]
-        steps = generated.shape[1]
-
-        results = []
-        for row in generated:
-            ids = row.tolist()
-            # No stop token means the row ran out of budget, which classify()
-            # reports as truncated_length rather than a reasoning error.
-            stop_at = next((i for i, t in enumerate(ids) if t in self.eos_ids), None)
-            finish = "stop" if stop_at is not None else "length"
-            kept = ids[:stop_at] if stop_at is not None else ids
-            results.append((self.tokenizer.decode(kept, skip_special_tokens=True).strip(),
-                            finish))
-        return results, steps, max_new
-
-    # Attention implementation used only while generating. Training runs on
-    # whatever the model loaded with (flex_attention on this build).
-    INFER_ATTN_IMPL = "eager"
-
-    def _swap_attn(self, model, impl):
-        """Point the model at a different attention implementation, if it allows it."""
-        if not impl or getattr(model.config, "_attn_implementation", None) == impl:
-            return
-        try:
-            model.set_attn_implementation(impl)
-        except Exception as e:
-            print(f"  [eval] could not switch attention to {impl}: "
-                  f"{type(e).__name__}: {e}", flush=True)
-
-    def _set_mode(self, model, inference):
-        """Flip the model between training and generation.
-
-        ATTENTION: training needs flex_attention (68.4 GB of 79.25 at 8k tokens;
-        eager OOMs there), but flex_attention cannot generate — HF's cache-aware
-        mask goes through create_block_mask, which raises ValueError on it. Eager
-        is cheap for decoding and is restored on the way out.
-
-        MODE: gradient checkpointing forces use_cache off, so generating in
-        training mode would recompute the prefix for every token.
-        """
-        if inference:
-            self._train_attn_impl = getattr(model.config, "_attn_implementation", None)
-            self._swap_attn(model, self.INFER_ATTN_IMPL)
-        else:
-            self._swap_attn(model, self._train_attn_impl)
-
-        fn = getattr(model, "for_inference" if inference else "for_training", None)
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception as e:
-                print(f"  [eval] Unsloth mode switch failed: {type(e).__name__}: {e}")
-        model.eval() if inference else model.train()
-
-    # --------------------------------------------------------------- round
-    def _run(self, trainer, pl_module, step):
-        model = pl_module.model
-        was_training = model.training
-        self._set_mode(model, inference=True)
-        model.eval()
-
-        self._round_idx += 1
-        round_idx = self._round_idx
-        pct = 100.0 * step / self.total_steps
-        n = len(self.records)
-        bar = "=" * 78
-        prompts = [format_prompt_only(r["question"], include_thinking=self.thinking_mode)
-                   for r in self.records]
-
-        # Even chunks, so an odd total leaves no tiny trailing batch that still
-        # costs a full decode pass.
-        total_batches = max(1, math.ceil(n / max(1, self.batch_size)))
-        bs = max(1, math.ceil(n / total_batches))
-
-        # Sort by prompt length so each batch is uniform: the per-batch
-        # MAX_SEQ_LEN clamp is set by the longest prompt in it, and left-padding
-        # goes to the batch maximum. Unsorted back into test order before grading.
-        enc_lens = [len(self.tokenizer(p, add_special_tokens=False)["input_ids"])
-                    for p in prompts]
-        order = sorted(range(len(prompts)), key=lambda k: enc_lens[k])
-        sorted_prompts = [prompts[k] for k in order]
-        lo, hi = enc_lens[order[0]], enc_lens[order[-1]]
-        print(f"\n{bar}\n"
-              f"GENERATIVE EVAL  round {round_idx}  |  step {step}/{self.total_steps} "
-              f"({pct:.0f}%)  |  {n} questions  |  batch={bs}  |  prompts {lo}-{hi} tok  "
-              f"|  max_new<={self.max_new_tokens}  |  thinking={self.thinking_mode}\n"
-              f"{bar}", flush=True)
-
-        # One line per batch: a live bar redraws several times a second and
-        # buries the log under thousands of near-identical lines.
-        # Release the allocator's cached blocks so the KV cache can use them.
-        torch.cuda.empty_cache()
-
-        completions, i, n_batches = [], 0, 0
-        started = time.time()
-        while i < len(prompts):
-            chunk = sorted_prompts[i:i + bs]
-            t_batch = time.time()
-            try:
-                out, steps, budget = self._generate_batch(model, chunk)
-            except torch.cuda.OutOfMemoryError:
-                # Training state is still resident; halve and retry, do not die.
-                torch.cuda.empty_cache()
-                if bs == 1:
-                    raise
-                bs = max(1, bs // 2)
-                total_batches = max(1, math.ceil(len(prompts) / bs))
-                print(f"  [eval] CUDA OOM -> retrying at batch_size={bs}", flush=True)
-                continue
-            completions.extend(out)
-            i += len(chunk)
-            n_batches += 1
-            dt = time.time() - t_batch
-            rate = i / max(1e-9, time.time() - started)
-            stopped = sum(1 for _, f in out if f == "stop")
-            print(f"  [eval] batch {n_batches}/{total_batches}  {i}/{len(prompts)} q  "
-                  f"|  {steps}/{budget} tok  |  {stopped}/{len(chunk)} finished  "
-                  f"|  {dt:.0f}s  |  eta {(len(prompts) - i) / max(1e-9, rate) / 60:.1f} min",
-                  flush=True)
-        elapsed = time.time() - started
-        torch.cuda.empty_cache()
-
-        # Undo the length sort so row i lines up with self.records[i] again.
-        in_order = [None] * len(prompts)
-        for pos, k in enumerate(order):
-            in_order[k] = completions[pos]
-
-        rows = [build_record(rec, text, finish, self.thinking_mode)
-                for rec, (text, finish) in zip(self.records, in_order)]
-
-        summary = summarize(f"round{round_idx}", rows, elapsed)
-        self._report(summary)
-        self._save_rows(round_idx, rows)
-        self._log_metrics(trainer, pl_module, summary)
-
-        self._set_mode(model, inference=False)
-        if was_training:
-            model.train()
-
-    # -------------------------------------------------------------- output
-    def _report(self, summary):
-        print(f"  [eval] {summary['Correct']} Correct / {summary['Wrong']} Wrong / "
-              f"{summary['Bad']} Bad  ->  {summary['accuracy']:.1f}%  "
-              f"in {summary['elapsed_sec'] / 60:.1f} min")
-        if summary["bad_reasons"]:
-            detail = "  ".join(f"{k}={v}" for k, v in sorted(summary["bad_reasons"].items()))
-            print(f"  [eval] bad reasons: {detail}")
-        for category, bucket in sorted(summary["per_category"].items()):
-            print(f"  [eval]   {category:<26} {bucket['correct']}/{bucket['n']} "
-                  f"= {bucket['accuracy']:.0f}%")
-
-    def _save_rows(self, round_idx, rows):
-        try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            out_path = self.output_dir / f"round{round_idx}.json"
-            out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False),
-                                encoding="utf-8")
-            print(f"  [eval] graded answers -> {out_path}", flush=True)
-        except Exception as e:
-            print(f"  [eval] could not write answers: {type(e).__name__}: {e}")
-
-    def _log_metrics(self, trainer, pl_module, summary):
-        metrics = {
-            'Validation/box_answer_match_accuracy': float(summary['accuracy']),
-            'Validation/correct_count': float(summary['Correct']),
-            'Validation/wrong_count': float(summary['Wrong']),
-            'Validation/bad_count': float(summary['Bad']),
-        }
-        for category, bucket in summary['per_category'].items():
-            metrics[f'Validation/acc_{category}'] = float(bucket['accuracy'])
-
-        for name, value in metrics.items():
-            try:
-                pl_module.log(name, value, logger=False, sync_dist=True,
-                              on_step=True, on_epoch=False,
-                              prog_bar=name.endswith('box_answer_match_accuracy'))
-            except Exception:
-                pass
-        trainer.callback_metrics.update(
-            {k: torch.tensor(v) for k, v in metrics.items()})
-        self._last_metrics = metrics
-        for lg in trainer.loggers:
-            try:
-                lg.log_metrics(metrics, step=trainer.global_step)
-            except Exception as e:
-                print(f"  [eval] {type(lg).__name__} rejected metrics: {e}")
 
 
 # ───────────────────
@@ -1450,8 +938,8 @@ if __name__ == '__main__':
         print(f"[logger]   experiment: {run_name}")
 
     # ---- Checkpoint callback
-    CKPT_MONITOR = 'Validation/box_answer_match_accuracy'
-    CKPT_NAME = '{epoch:02d}-{Validation/loss:.4f}-{Validation/box_answer_match_accuracy:.2f}'
+    CKPT_MONITOR = ACCURACY_KEY                  # published by the eval callback
+    CKPT_NAME = '{epoch:02d}-{Validation/loss:.4f}-{' + ACCURACY_KEY + ':.2f}'
     ckpt = pl.callbacks.ModelCheckpoint(
         monitor=CKPT_MONITOR,
         save_top_k=1,
@@ -1480,15 +968,20 @@ if __name__ == '__main__':
     )
 
     # ---- Generative evaluation on the held-out test set, every 20% of training
-    boxed_eval = BoxedAnswerEvalCallback(
+    boxed_eval = NemotronMoEEvalCallback(
         tokenizer=tokenizer,
         records=val_records,
-        num_samples=CFG.INFER_SAMPLES,       # None -> all 404 held-out questions
-        every_pct=CFG.INFER_EVERY_PERCENTAGE,
-        max_new_tokens=CFG.INFER_MAX_NEW_TOKENS,
         total_steps=CFG.STEPS,
-        batch_size=CFG.INFER_BATCH_SIZE,
         output_dir=VALIDATION_DIR,
+        every_pct=CFG.INFER_EVERY_PERCENTAGE,
+        num_samples=CFG.INFER_SAMPLES,       # None -> all 404 held-out questions
+        batch_size=CFG.INFER_BATCH_SIZE,
+        max_new_tokens=CFG.INFER_MAX_NEW_TOKENS,
+        max_total_len=CFG.MAX_SEQ_LEN,
+        thinking_mode=CFG.INCLUDE_THINKING,
+        stop_tokens=CFG.INFER_STOP_TOKENS,
+        seed=CFG.SEED,
+        generate_fn=hf_generate_batch,       # HF backbone has no generate_batch
     )
 
     # ---- Trainer

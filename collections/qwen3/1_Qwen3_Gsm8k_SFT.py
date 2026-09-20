@@ -1,9 +1,5 @@
 import sys
 import math
-import json
-import random
-import re
-import time
 import bitsandbytes as bnb
 from pathlib import Path
 from functools import partial
@@ -23,14 +19,17 @@ sys.path.append(str(COLLECTIONS_DIR))
 sys.path.append(str(MODELS_DIR))
 
 from data.Gsm8k.data_utils import (
-    load_gsm8k_json, Gsm8kDataset, custom_collate_fn, format_prompt_only
+    load_gsm8k_json, Gsm8kDataset, custom_collate_fn
 )
+# Grading + the periodic generative eval live with the dataset, so every GSM8K
+# run (dense, MoE, whatever comes next) scores with the exact same code.
+from data.Gsm8k.metric import Gsm8kEvalCallback, ACCURACY_KEY
 from utils.checkpoint_utils import (
     LoRAMergeCheckpoint, plot_training_curves,
 )
 
 from qwen3_dense import (
-    Qwen3Model, KVCache, from_pretrained,
+    Qwen3Model, from_pretrained,
     QWEN_06B_CFG, QWEN_1B7_CFG, QWEN_4B_CFG,
     QWEN_8B_CFG, QWEN_14B_CFG, QWEN_32B_CFG
 )
@@ -95,10 +94,18 @@ class CFG:
     # MAX_SEQ_LEN, so the model has never once produced a completion longer than
     # MAX_SEQ_LEN - len(prompt); the longest ground truth that survives the
     # filter is 346 tokens (p99 = 221). Generating 768 was both out of
-    # distribution and ~2x wasted compute. _generate_batch clamps this again per
-    # batch to MAX_SEQ_LEN - prompt_len, so a long prompt can never push
-    # generation past what training ever saw.
+    # distribution and ~2x wasted compute. Qwen3Model.generate_batch clamps this
+    # again per batch to MAX_SEQ_LEN - prompt_len, so a long prompt can never
+    # push generation past what training ever saw.
     INFER_MAX_NEW_TOKENS = MAX_SEQ_LEN - 128 if INCLUDE_THINKING else 64
+
+    # Turn-enders BEYOND the tokenizer's own eos_token_id, which the eval
+    # callback already picks up on its own. Qwen3's chat format ends an
+    # assistant turn with <|im_end|> but also honours <|endoftext|>; this is the
+    # same pair the vLLM inference scripts pass as stop_token_ids, and these
+    # tokens are Qwen3's, so they are declared here rather than in the shared
+    # dataset callback.
+    INFER_STOP_TOKENS = ("<|endoftext|>", "<|im_end|>")
 
 
 # -----------------
@@ -111,7 +118,6 @@ class LoRALayer(torch.nn.Module):
         self.A = torch.nn.Parameter(torch.empty(in_dim, rank))
         torch.nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
-        self.alpha = alpha
         self.scaling = alpha / rank  # Standard LoRA scaling: α/r
 
     def forward(self, x):
@@ -597,416 +603,6 @@ class Qwen3_Lightning(pl.LightningModule):
         return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
 
 
-# --------------------
-# LIGHTNING AI LOGGING
-# --------------------
-
-def lightning_ai_ready():
-    """True when remote tracking can actually run: package + credentials.
-
-    LitLogger falls back to an interactive browser login when unauthenticated,
-    which blocks a headless run forever, so the credentials are checked before
-    the logger is ever constructed.
-
-    The `litlogger` backend is imported lazily inside LitLogger.experiment, i.e.
-    from Trainer.fit — long after the base weights are on the GPU. A missing
-    package would therefore kill the run minutes in, so it is checked up front
-    and degrades to CSV exactly like missing credentials do.
-    """
-    import os
-    from importlib.util import find_spec
-
-    if find_spec("litlogger") is None:
-        print("[logger] `litlogger` is not installed "
-              "(`pip install litlogger` enables Lightning AI tracking).")
-        return False
-    if os.environ.get("LIGHTNING_API_KEY") and os.environ.get("LIGHTNING_USER_ID"):
-        return True
-    if (Path.home() / ".lightning" / "credentials.json").is_file():
-        return True
-    print("[logger] No Lightning AI credentials found.")
-    return False
-
-
-# -----------------------------------
-# ANSWER GRADING  (Correct/Wrong/Bad)
-# -----------------------------------
-# Ported from inference/3_Qwen3_Gsm8k_vLLM_Inference.ipynb so a number printed
-# mid-training drops straight into that notebook's comparison table. The two
-# graders have to stay identical or the v1/v2/v3 rows stop being comparable.
-
-# A well-formed boxed answer: literal \boxed{...} with no nested braces.
-# Rejects "\boxed{" (unclosed), "boxed{5}" (no backslash) and "\boxed{}" (empty).
-BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-THINK_CLOSE = "</think>"
-
-
-def normalize_answer(text):
-    """GSM8K answers are plain numbers — strip formatting noise, not content."""
-    return text.strip().replace(",", "").replace("$", "").rstrip(".").strip()
-
-
-def to_number(text):
-    """Return the numeric value of an answer string, or None if it isn't one."""
-    try:
-        return float(normalize_answer(text))
-    except (TypeError, ValueError):
-        return None
-
-
-def classify(completion, expected, thinking_mode, finish_reason):
-    """Grade one completion -> (matching, prediction, thinking_model, bad_reason).
-
-    ``matching`` is one of three labels:
-        Correct  a well-formed \boxed{...} whose value equals the ground truth
-        Wrong    a clean numeric answer, but not the right number
-        Bad      no usable answer could be extracted at all
-
-    ``bad_reason`` keeps a budget artefact from being read as a reasoning error:
-        empty_output        model returned nothing
-        think_not_closed    thinking mode, </think> never emitted
-        truncated_length    hit max_new_tokens with no answer
-        no_boxed_answer     finished cleanly but never wrote \boxed{...}
-        empty_box           wrote \boxed{} with nothing inside
-        non_numeric_answer  boxed something that isn't a number
-    """
-    text = completion or ""
-
-    # 1. Split the reasoning off. Only text AFTER </think> may carry the final
-    #    answer — scanning the chain of thought would credit a lucky intermediate.
-    if thinking_mode:
-        if THINK_CLOSE in text:
-            thinking_model, _, answer_region = text.partition(THINK_CLOSE)
-            thinking_model, answer_region = thinking_model.strip(), answer_region.strip()
-        else:
-            return ("Bad", None, text.strip(),
-                    "empty_output" if not text.strip() else "think_not_closed")
-    else:
-        thinking_model, answer_region = "", text.strip()
-
-    if not text.strip():
-        return "Bad", None, thinking_model, "empty_output"
-
-    # 2. The LAST box wins: reasoning often boxes an intermediate result first.
-    matches = BOXED_RE.findall(answer_region)
-    if not matches:
-        reason = "truncated_length" if finish_reason == "length" else "no_boxed_answer"
-        return "Bad", None, thinking_model, reason
-
-    prediction = matches[-1].strip()
-    if not prediction:
-        return "Bad", None, thinking_model, "empty_box"
-
-    pred_num, gold_num = to_number(prediction), to_number(expected)
-    if pred_num is None:
-        return "Bad", prediction, thinking_model, "non_numeric_answer"
-
-    matching = "Correct" if (gold_num is not None and pred_num == gold_num) else "Wrong"
-    return matching, prediction, thinking_model, None
-
-
-def build_record(rec, completion, finish_reason, thinking_mode):
-    """One graded row, in the schema the vLLM notebook writes."""
-    matching, prediction, thinking_model, bad_reason = classify(
-        completion, rec["answer"], thinking_mode, finish_reason
-    )
-    return {
-        "question": rec["question"],
-        "thinking": rec["thinking"],
-        "answer": rec["answer"],
-        "num_gt_tokens": rec["num_gt_tokens"],
-        "prediction": prediction,
-        "thinking-model": thinking_model,
-        "matching": matching,
-        # --- diagnostics ---
-        "bad_reason": bad_reason,
-        "finish_reason": finish_reason,
-    }
-
-
-def summarize(version, rows, elapsed=None):
-    """Counts + boxed-answer accuracy for one evaluation round."""
-    n = len(rows)
-    counts = {k: sum(r["matching"] == k for r in rows)
-              for k in ("Correct", "Wrong", "Bad")}
-    bad_reasons = {}
-    for r in rows:
-        if r["bad_reason"]:
-            bad_reasons[r["bad_reason"]] = bad_reasons.get(r["bad_reason"], 0) + 1
-    return {"version": version, "questions": n, **counts,
-            "accuracy": 100.0 * counts["Correct"] / max(1, n),
-            "bad_reasons": bad_reasons, "elapsed_sec": elapsed}
-
-
-# --------------------------------------------
-# PERIODIC FULL-TEST-SET GENERATIVE EVALUATION
-# --------------------------------------------
-
-class BoxedAnswerEvalCallback(pl.Callback):
-    """Solve the whole held-out test set by generation, 5 times during training.
-
-    Fires every ``every_pct`` of the planned optimizer steps (0.20 -> 20/40/60/
-    80/100%), greedily decodes every test question and grades it with the same
-    classify() the vLLM notebook uses.
-
-    This replaces a 10-question probe whose +-32 points of sampling noise made
-    round-to-round movement unreadable. Scoring all 1319 only became affordable
-    once Qwen3Model grew a KVCache: one forward per new token instead of a full
-    recompute of the sequence, with ``batch_size`` questions decoded at once
-    behind a left-padding mask.
-
-    Runs from on_train_batch_end, which Lightning calls just BEFORE the
-    validation loop (training_epoch_loop: advance() -> on_advance_end()), so the
-    metrics land in callback_metrics in time for the checkpoint callbacks that
-    monitor them on_validation_end.
-    """
-
-    # <|endoftext|> and <|im_end|> both end an assistant turn; same pair the
-    # notebook passes to vLLM as stop_token_ids.
-    STOP_TOKENS = ("<|endoftext|>", "<|im_end|>")
-    STOP_TOKEN_IDS_FALLBACK = (151643, 151645)
-
-    def __init__(self, tokenizer, records, every_pct, max_new_tokens, total_steps,
-                 batch_size, output_dir, num_samples=None, seed=CFG.SEED):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        # Hard ceiling on prompt + generation, matching the training filter.
-        self.max_total_len = CFG.MAX_SEQ_LEN
-        self.batch_size = batch_size
-        # Where each round's graded answers land: logs/<run_name>/validation/
-        self.output_dir = Path(output_dir)
-        self.total_steps = max(1, total_steps)
-        self.every = max(1, int(round(self.total_steps * every_pct)))
-        self.thinking_mode = CFG.INCLUDE_THINKING
-
-        # num_samples=None -> the full test set, which is the whole point here.
-        if num_samples is None or num_samples >= len(records):
-            self.records = list(records)
-        else:
-            self.records = random.Random(seed).sample(list(records), num_samples)
-
-        special = getattr(tokenizer, "_special_to_id", {}) or {}
-        ids = {special.get(t) for t in self.STOP_TOKENS} - {None}
-        self.eos_ids = ids or set(self.STOP_TOKEN_IDS_FALLBACK)
-        self.eos_ids.add(tokenizer.eos_token_id)
-        self.pad_id = tokenizer.eos_token_id
-
-        self._fired = set()
-        self._round_idx = 0
-
-    # ---------------------------------------------------------- scheduling
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        step = pl_module._opt_step
-        if step == 0 or step % self.every != 0 or step in self._fired:
-            return
-        self._fired.add(step)
-        self._run(trainer, pl_module, step)
-
-    def on_train_end(self, trainer, pl_module):
-        # Final round, unless a boundary already fired close to the end.
-        step = pl_module._opt_step
-        if step <= 0 or step in self._fired:
-            return
-        if self._fired and (step - max(self._fired)) < self.every // 2:
-            return
-        self._fired.add(step)
-        self._run(trainer, pl_module, step)
-
-    # ---------------------------------------------------------- generation
-    @torch.no_grad()
-    def _generate_batch(self, model, prompts):
-        """Greedy-decode a batch of prompts -> [(text, finish_reason), ...].
-
-        Prompts are LEFT-padded so every row's next-token slot is the last
-        column and the whole batch shares one start_pos. RoPE is relative, so
-        the shift a pad prefix adds cancels out of every attention score; the
-        pad slots themselves are masked out of the real rows (see
-        GroupedQueryAttention.forward).
-        """
-        device = next(model.parameters()).device
-        enc = [self.tokenizer.encode(p) for p in prompts]
-        B, T = len(enc), max(len(e) for e in enc)
-
-        input_ids = torch.full((B, T), self.pad_id, dtype=torch.long, device=device)
-        pad_mask = torch.ones((B, T), dtype=torch.bool, device=device)
-        for i, ids in enumerate(enc):
-            input_ids[i, T - len(ids):] = torch.tensor(ids, dtype=torch.long, device=device)
-            pad_mask[i, T - len(ids):] = False
-
-        # Never generate past what training ever produced (see INFER_MAX_NEW_TOKENS).
-        max_new = max(1, min(self.max_new_tokens, self.max_total_len - T))
-
-        cache = KVCache(len(model.transformer_blocks))
-        out_ids = [[] for _ in range(B)]
-        finished = [False] * B
-
-        # The Trainer runs the forward pass under AMP autocast. The 4-bit base
-        # layers compute in bfloat16 while the LoRA adapters stay fp32, so the
-        # same autocast is required here or the matmuls disagree on dtype.
-        amp = torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                             enabled=device.type == 'cuda')
-
-        with amp:
-            logits = model(input_ids, cache=cache, start_pos=0, pad_mask=pad_mask,
-                           logits_last_only=True)
-        next_tok = logits[:, -1, :].argmax(dim=-1)
-        del logits
-
-        steps = 0
-        for step in range(max_new):
-            steps = step + 1
-            for i, t in enumerate(next_tok.tolist()):   # one device sync per step
-                if finished[i]:
-                    continue
-                if t in self.eos_ids:
-                    finished[i] = True
-                else:
-                    out_ids[i].append(t)
-            if all(finished):
-                break
-
-            start_pos = pad_mask.shape[1]
-            pad_mask = torch.cat(
-                [pad_mask, torch.zeros(B, 1, dtype=torch.bool, device=device)], dim=1)
-            with amp:
-                logits = model(next_tok[:, None], cache=cache,
-                               start_pos=start_pos, pad_mask=pad_mask,
-                               logits_last_only=True)
-            next_tok = logits[:, -1, :].argmax(dim=-1)
-
-        cache.reset()
-        # A row that never emitted a stop token ran out of budget, which
-        # classify() reports as truncated_length rather than a reasoning error.
-        out = [(self.tokenizer.decode(ids).strip(),
-                "stop" if finished[i] else "length")
-               for i, ids in enumerate(out_ids)]
-        return out, steps, max_new
-
-    # --------------------------------------------------------------- round
-    def _run(self, trainer, pl_module, step):
-        model = pl_module.model
-        was_training = model.training
-        model.eval()
-
-        self._round_idx += 1
-        round_idx = self._round_idx
-        pct = 100.0 * step / self.total_steps
-        n = len(self.records)
-        bar = "=" * 78
-        prompts = [format_prompt_only(r["question"], include_thinking=self.thinking_mode)
-                   for r in self.records]
-
-        # Even chunks: 1319 at batch 256 becomes 6 x 220, not 5 x 256 + 1 x 39.
-        # Wall time is set by the chunk COUNT (a decode step costs the same
-        # whatever the batch), so evening them out is free and cuts peak memory.
-        total_batches = max(1, math.ceil(n / max(1, self.batch_size)))
-        bs = max(1, math.ceil(n / total_batches))
-
-        # Group questions of similar prompt length into the same batch. Two
-        # reasons, both material:
-        #   1. the MAX_SEQ_LEN clamp below is per batch, computed from the
-        #      LONGEST prompt in it — unsorted, one 217-token prompt would cut
-        #      every other row in that batch down to the same short budget;
-        #   2. left-padding is to the batch maximum, so mixed lengths pad short
-        #      prompts out with dead positions that still cost KV cache.
-        # Results are put back in test-set order before grading.
-        enc_lens = [len(self.tokenizer.encode(p)) for p in prompts]
-        order = sorted(range(len(prompts)), key=lambda k: enc_lens[k])
-        sorted_prompts = [prompts[k] for k in order]
-        lo, hi = enc_lens[order[0]], enc_lens[order[-1]]
-        print(f"\n{bar}\n"
-              f"GENERATIVE EVAL  round {round_idx}  |  step {step}/{self.total_steps} "
-              f"({pct:.0f}% of training)\n"
-              f"{n} questions  |  batch={bs}  |  prompts {lo}-{hi} tok  "
-              f"|  max_new_tokens<={self.max_new_tokens} "
-              f"(clamped per batch to MAX_SEQ_LEN={self.max_total_len} - prompt)  "
-              f"|  thinking={self.thinking_mode}\n"
-              f"{bar}", flush=True)
-
-        # One line per batch — six for a full round. A live progress bar was
-        # tried here and removed: the terminal redraws it several times a second
-        # with a carriage return, and `script` records every redraw, so a single
-        # round buried the log under thousands of near-identical lines.
-        completions, i, n_batches = [], 0, 0
-        started = time.time()
-        while i < len(prompts):
-            chunk = sorted_prompts[i:i + bs]
-            t_batch = time.time()
-            try:
-                out, steps, budget = self._generate_batch(model, chunk)
-            except torch.cuda.OutOfMemoryError:
-                # Training state is still resident, so the eval batch has to fit
-                # in what is left. Halve and retry rather than kill the run.
-                torch.cuda.empty_cache()
-                if bs == 1:
-                    raise
-                bs = max(1, bs // 2)
-                total_batches = max(1, math.ceil(len(prompts) / bs))
-                print(f"  [eval] CUDA OOM -> retrying at batch_size={bs}", flush=True)
-                continue
-            completions.extend(out)
-            i += len(chunk)
-            n_batches += 1
-            dt = time.time() - t_batch
-            rate = i / max(1e-9, time.time() - started)
-            stopped = sum(1 for _, f in out if f == "stop")
-            print(f"  [eval] batch {n_batches}/{total_batches}  {i}/{len(prompts)} q  "
-                  f"|  {steps}/{budget} tok  |  {stopped}/{len(chunk)} finished  "
-                  f"|  {dt:.0f}s  |  eta {(len(prompts) - i) / max(1e-9, rate) / 60:.1f} min",
-                  flush=True)
-        elapsed = time.time() - started
-        torch.cuda.empty_cache()
-
-        # Undo the length sort so row i lines up with self.records[i] again.
-        in_order = [None] * len(prompts)
-        for pos, k in enumerate(order):
-            in_order[k] = completions[pos]
-
-        rows = [build_record(rec, text, finish, self.thinking_mode)
-                for rec, (text, finish) in zip(self.records, in_order)]
-
-        summary = summarize(f"round{round_idx}", rows, elapsed)
-        self._save_rows(round_idx, rows)
-        self._log_metrics(trainer, pl_module, summary)
-
-        if was_training:
-            model.train()
-
-    # -------------------------------------------------------------- output
-    def _save_rows(self, round_idx, rows):
-        try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            out_path = self.output_dir / f"round{round_idx}.json"
-            out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False),
-                                encoding="utf-8")
-            print(f"  [eval] graded answers -> {out_path}", flush=True)
-        except Exception as e:
-            print(f"  [eval] could not write answers: {type(e).__name__}: {e}")
-
-    def _log_metrics(self, trainer, pl_module, summary):
-        metrics = {
-            'Validation/box_answer_match_accuracy': float(summary['accuracy']),
-            'Validation/correct_count': float(summary['Correct']),
-            'Validation/wrong_count': float(summary['Wrong']),
-            'Validation/bad_count': float(summary['Bad']),
-        }
-        for name, value in metrics.items():
-            try:
-                pl_module.log(name, value, logger=False, sync_dist=True,
-                              on_step=True, on_epoch=False,
-                              prog_bar=name.endswith('box_answer_match_accuracy'))
-            except Exception:
-                pass
-        trainer.callback_metrics.update(
-            {k: torch.tensor(v) for k, v in metrics.items()})
-        for lg in trainer.loggers:
-            try:
-                lg.log_metrics(metrics, step=trainer.global_step)
-            except Exception as e:
-                print(f"  [eval] {type(lg).__name__} rejected metrics: {e}")
-
-
 if __name__ == '__main__':
 
     # ---- Data Preparation
@@ -1044,7 +640,6 @@ if __name__ == '__main__':
     from datetime import datetime
     date = datetime.now().strftime("%d_%m_%y")
     mode_tag = "LoRA" if CFG.TUNING_MODE == "lora" else f"QLoRA_{CFG.QUANT_BITS}"
-    think_tag = "CoT" if CFG.INCLUDE_THINKING else "Direct"
     think_suffix = "_think" if CFG.INCLUDE_THINKING else ""
 
     exp_name = f'Qwen3_Gsm8k_{CFG.MODEL_SIZE}_{mode_tag}{think_suffix}'
@@ -1084,8 +679,8 @@ if __name__ == '__main__':
     print(f"[logger]   experiment: {run_name}")
 
     # ---- Checkpoint callback
-    CKPT_MONITOR = 'Validation/box_answer_match_accuracy'
-    CKPT_NAME = '{epoch:02d}-{Validation/loss:.4f}-{Validation/box_answer_match_accuracy:.2f}'
+    CKPT_MONITOR = ACCURACY_KEY
+    CKPT_NAME = '{epoch:02d}-{Validation/loss:.4f}-{' + ACCURACY_KEY + ':.2f}'
     ckpt = pl.callbacks.ModelCheckpoint(
         monitor=CKPT_MONITOR,
         save_top_k=1,
@@ -1107,15 +702,19 @@ if __name__ == '__main__':
     )
 
     # ---- Generative evaluation on the FULL test set, every 20% of training
-    boxed_eval = BoxedAnswerEvalCallback(
+    boxed_eval = Gsm8kEvalCallback(
         tokenizer=tokenizer,
         records=val_records,
-        num_samples=CFG.INFER_SAMPLES,       # None -> all 1319 questions
-        every_pct=CFG.INFER_EVERY_PERCENTAGE,
-        max_new_tokens=CFG.INFER_MAX_NEW_TOKENS,
         total_steps=CFG.STEPS,
-        batch_size=CFG.INFER_BATCH_SIZE,
         output_dir=VALIDATION_DIR,
+        every_pct=CFG.INFER_EVERY_PERCENTAGE,
+        num_samples=CFG.INFER_SAMPLES,
+        batch_size=CFG.INFER_BATCH_SIZE,
+        max_new_tokens=CFG.INFER_MAX_NEW_TOKENS,
+        max_total_len=CFG.MAX_SEQ_LEN,
+        thinking_mode=CFG.INCLUDE_THINKING,
+        stop_tokens=CFG.INFER_STOP_TOKENS,
+        seed=CFG.SEED,
     )
 
     trainer = pl.Trainer(
@@ -1125,7 +724,7 @@ if __name__ == '__main__':
         logger=loggers,
         max_epochs=CFG.EPOCHS,
         precision='bf16',
-        val_check_interval=CFG.VAL_EVERY_N_STEPS,  # full test set every 20%
+        val_check_interval=CFG.VAL_EVERY_N_STEPS,
         check_val_every_n_epoch=1,
         log_every_n_steps=1,
         num_sanity_val_steps=0,

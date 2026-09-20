@@ -105,20 +105,6 @@ class FeedForward(nn.Module):
 
 # ------- KV Cache (inference only) -------
 class KVCache:
-    """Per-layer key/value store that turns generation from O(T^2) into O(T).
-
-    Without it every new token re-runs a forward pass over the whole sequence,
-    so decoding 768 tokens costs 768 full-sequence forwards. That is why the old
-    10-question probe was all the training loop could afford; scoring the full
-    1319-question GSM8K test set that way would take ~14 h per round.
-
-    Training never constructs one: ``Qwen3Model.forward(x)`` leaves ``cache=None``
-    and runs exactly the full-sequence path it always has.
-
-    Keys/values are stored BEFORE the GQA head expansion (``n_kv_groups``, not
-    ``n_heads``) -- 5x smaller for Qwen3-14B (8 groups vs 40 heads).
-    """
-
     def __init__(self, n_layers):
         self.keys = [None] * n_layers
         self.values = [None] * n_layers
@@ -144,7 +130,6 @@ class GroupedQueryAttention(nn.Module):
     '''The facts 
     The big question: Do we always need to train a GQA model from scratch? 
     The answer is no.
-    
     The original GQA paper showed that we can take an existing Multi-Head Attention model and convert it into a GQA model very cheaply. 
     This is called uptraining.
 
@@ -154,7 +139,8 @@ class GroupedQueryAttention(nn.Module):
     Do the same for the Value weight matrices. 
     This gives us one shared Key and one shared Value per group.
     
-    Step 3: Fine-tune the model for a short time. The original paper showed that uptraining with just around 5% of the original pre-training compute is enough to recover quality close to full MHA.
+    Step 3: Fine-tune the model for a short time. The original paper showed that uptraining with just around 5% of the original pre-training 
+    compute is enough to recover quality close to full MHA.
     This is one of the main reasons GQA was adopted so quickly. 
     Labs did not have to throw away their existing MHA models or spend huge compute to train new ones. 
     They could just uptrain them into GQA.
@@ -315,6 +301,22 @@ class Block(nn.Module):
         return x
 
 
+# ------- Top-p (nucleus) sampling -------
+def top_p_filter(probas, top_p):
+    """Keep the smallest set of tokens whose cumulative mass reaches top_p."""
+    if top_p is None or top_p >= 1.0:
+        return probas
+
+    sorted_probas, sorted_idx = torch.sort(probas, dim=-1, descending=True)
+    prefix = torch.cumsum(sorted_probas, dim=-1) - sorted_probas
+    keep = prefix < top_p
+    keep[:, 0] = True                       # always keep the most likely token
+
+    kept = torch.where(keep, sorted_probas, torch.zeros_like(sorted_probas))
+    filtered = torch.zeros_like(probas).scatter(-1, sorted_idx, kept)
+    return filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
 # ------- Qwen3 Model -------
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
@@ -363,6 +365,82 @@ class Qwen3Model(nn.Module):
         logits = self.out_head(x.to(self.dtype))
 
         return logits
+
+    # ------- Batched generation -------
+    @torch.no_grad()
+    def generate_batch(self, tokenizer, prompts, max_new_tokens=256,
+                       max_total_len=None, eos_ids=None, pad_id=None,
+                       temperature=0.0, top_p=None):
+
+        # 
+        device = next(self.parameters()).device
+        eos_ids = {tokenizer.eos_token_id} if eos_ids is None else set(eos_ids)
+        enc = [tokenizer.encode(p) for p in prompts]
+        B, T = len(enc), max(len(e) for e in enc)
+
+        # Pad - inputs - mask  
+        pad_id = getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id
+        input_ids = torch.full((B, T), pad_id, dtype=torch.long, device=device)
+        pad_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+
+        # Left-pad the prompts into one (B, T) block
+        for i, ids in enumerate(enc):
+            input_ids[i, T - len(ids):] = torch.tensor(ids, dtype=torch.long, device=device)
+            pad_mask[i, T - len(ids):] = False
+
+        # Never generate past what training ever saw
+        budget = max_new_tokens if max_total_len is None else min(max_new_tokens, max_total_len - T)
+        budget = max(1, budget)
+
+        # Autocast mixed precision matching the training 
+        amp = torch.autocast(
+            device_type=device.type, 
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda"
+        )
+
+        # KVcache setup  
+        cache = KVCache(len(self.transformer_blocks))
+        out_ids = [[] for _ in range(B)]
+        finished = [False] * B
+
+        # Prefill: one pass over the whole prompt, filling the cache
+        with amp:
+            logits = self(
+                input_ids, cache=cache, start_pos=0, pad_mask=pad_mask, logits_last_only=True
+            )[:, -1]
+
+        for steps in range(1, budget + 1):
+            if temperature:
+                probas = torch.softmax(logits.float() / temperature, dim=-1)
+                probas = top_p_filter(probas, top_p)
+                next_token = torch.multinomial(probas, num_samples=1).squeeze(-1)
+            else:
+                next_token = logits.argmax(dim=-1)
+
+            for i, token_id in enumerate(next_token.tolist()):
+                if finished[i]:
+                    continue
+                if token_id in eos_ids:
+                    finished[i] = True
+                else:
+                    out_ids[i].append(token_id)
+            if all(finished):
+                break
+
+            # Decode: one token per pass, reading the cache
+            pad_mask = torch.cat(
+                [pad_mask, torch.zeros(B, 1, dtype=torch.bool, device=device)], dim=1)
+
+            with amp:
+                logits = self(next_token[:, None], cache=cache,
+                              start_pos=pad_mask.shape[1] - 1, pad_mask=pad_mask,
+                              logits_last_only=True)[:, -1]
+
+        cache.reset()
+        results = [(tokenizer.decode(ids).strip(), "stop" if finished[i] else "length")
+                   for i, ids in enumerate(out_ids)]
+        return results, steps, budget
 
 
 # ------- Loading from local merged .pth (post LoRA-merge) -------
@@ -493,51 +571,30 @@ def generate(
     max_length=256,
     num_sequences=1,
     temperature=1.0,
-    top_k=0,
+    top_p=None,
     eos_token_id=None,
 ):
-    device = next(model.parameters()).device
+    """Single-prompt wrapper over Qwen3Model.generate_batch.
+
+    Keeps the old call signature while reusing the one KV-cached decode loop,
+    so there is no second sampling implementation to keep in step.
+
+    num_sequences decodes that many copies as ONE batch, which is faster than
+    looping and only differs from repeated calls when temperature > 0.
+
+    Returns prompt + completion (a list when num_sequences > 1, else the string).
+    """
     model.eval()
-
-    if eos_token_id is None:
-        eos_token_id = tokenizer.eos_token_id
-
-    results = []
-    for _ in range(num_sequences):
-        input_ids = tokenizer.encode(prompt)
-        input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
-
-        with torch.no_grad():
-            for _ in range(max_length):
-                logits = model(input_ids)
-                next_logits = logits[:, -1, :]  # (1, vocab_size)
-
-                # Greedy decoding
-                if temperature == 0.0:
-                    next_token = next_logits.argmax(dim=-1, keepdim=True)
-                else:
-                    # Apply temperature
-                    if temperature != 1.0:
-                        next_logits = next_logits / temperature
-
-                    # Apply top-k filtering
-                    if top_k > 0:
-                        top_values, _ = torch.topk(next_logits, top_k, dim=-1)
-                        min_top = top_values[:, -1].unsqueeze(-1)
-                        next_logits = next_logits.masked_fill(next_logits < min_top, -torch.inf)
-
-                    probs = torch.softmax(next_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-
-                if next_token.item() == eos_token_id:
-                    break
-
-        output_ids = input_ids[0].tolist()
-        results.append(tokenizer.decode(output_ids))
-
-    return results if num_sequences > 1 else results[0]
+    results, _, _ = model.generate_batch(
+        tokenizer,
+        [prompt] * num_sequences,
+        max_new_tokens=max_length,
+        eos_ids=None if eos_token_id is None else {eos_token_id},
+        temperature=temperature,
+        top_p=top_p,
+    )
+    texts = [prompt + text for text, _ in results]
+    return texts if num_sequences > 1 else texts[0]
 
 
 @dataclass 
@@ -687,5 +744,5 @@ class QWEN_32B_CFG:
 #     prompt = "Explain large language models in a single sentence."
 #     output = generate(
 #         model, tokenizer, prompt, 
-#         max_length=200, temperature=0.0, top_k=0.0
+#         max_length=200, temperature=0.0, top_p=None
 #     )

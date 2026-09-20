@@ -96,6 +96,7 @@ def load_gsm8k_json(json_path: str) -> list:
 # TORCH DATASET
 # -----------------
 class Gsm8kDataset(Dataset):
+
     def __init__(self, records, tokenizer, max_seq_len=None, include_thinking=False):
         """Pre-tokenize all samples into token ID lists.
 
@@ -133,8 +134,10 @@ class Gsm8kDataset(Dataset):
             self.prompt_lengths.append(len(prompt_ids))
             self.records.append(rec)
 
+
     def __getitem__(self, index):
         return self.encoded_texts[index], self.prompt_lengths[index]
+
 
     def __len__(self):
         return len(self.encoded_texts)
